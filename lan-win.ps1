@@ -1235,69 +1235,59 @@ function Do-Update {
     return
   }
 
-  # 1) скачиваем архив во временную папку — рабочую копию пока не трогаем
+  # 1) манифест и файлы качаем ПОИМЁННО во временную папку — рабочую копию не трогаем.
+  #    Архив (tar.gz) на Windows не годится: tar.exe декодирует кириллические имена
+  #    как CP866 и создаёт файлы-кракозябры. Поэтому берём файлы напрямую.
   $tmp = Join-Path $env:TEMP ('lt-upd-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-  $tgz = Join-Path $tmp 'lt.tar.gz'
-  $url = "https://codeload.github.com/$UpdateRepo/tar.gz/refs/heads/$UpdateBranch"
-  Write-Host "  Скачиваю архив..." -ForegroundColor Cyan
+  $newDir = Join-Path $tmp 'new'
+  New-Item -ItemType Directory -Force -Path $newDir | Out-Null
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  $rawBase = "https://raw.githubusercontent.com/$UpdateRepo/$UpdateBranch"
+
+  Write-Host "  Читаю список файлов..." -ForegroundColor Cyan
+  $manLocal = Join-Path $tmp 'MANIFEST.txt'
   try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $url -OutFile $tgz -UseBasicParsing -TimeoutSec 120
+    Invoke-WebRequest -Uri "$rawBase/MANIFEST.txt`?nocache=$([DateTime]::UtcNow.Ticks)" -OutFile $manLocal -UseBasicParsing -TimeoutSec 20
   } catch {
-    Write-Host "  [!] Скачать не удалось: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "  [!] Не скачал MANIFEST.txt: $($_.Exception.Message)" -ForegroundColor Red
     Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
     return
   }
+  # читаем с диска как UTF-8: сеть декодирует кириллицу ненадёжно
+  $manifest = [IO.File]::ReadAllText($manLocal, [Text.Encoding]::UTF8)
 
-  $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-  if (-not (Test-Path $tar)) {
-    Write-Host "  [!] Нет tar.exe (нужен Windows 10 1803+). Обнови вручную: git clone репозитория." -ForegroundColor Red
-    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
-    return
-  }
-  & $tar -xzf $tgz -C $tmp 2>$null
-  $root = Get-ChildItem $tmp -Directory | Select-Object -First 1
-  if (-not $root) {
-    Write-Host "  [!] Архив распаковался пустым." -ForegroundColor Red
-    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
-    return
-  }
-  Write-Host "  Проверяю содержимое..." -ForegroundColor Cyan
-
-  # 2) сверяем sha256 каждого файла с MANIFEST.txt из репозитория
-  # берём MANIFEST.txt ИЗ САМОГО АРХИВА: читаем с диска как UTF-8 (сеть ненадёжно
-  # декодирует кириллические имена) и это гарантированно тот же коммит, что и файлы
-  $manPath = Join-Path $root.FullName 'MANIFEST.txt'
-  if (-not (Test-Path $manPath)) {
-    Write-Host "  [!] В архиве нет MANIFEST.txt — проверить целостность не могу, отменяю." -ForegroundColor Red
-    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
-    return
-  }
-  $manifest = [IO.File]::ReadAllText($manPath, [Text.Encoding]::UTF8)
-  $bad = 0; $checked = 0
+  Write-Host "  Скачиваю и проверяю файлы..." -ForegroundColor Cyan
+  $queue = @(); $bad = 0; $idx = 0
   foreach ($line in ($manifest -split "`r?`n")) {
     if ($line -notmatch '^([0-9a-fA-F]{64})\s+(.+)$') { continue }
     $sum = $Matches[1].ToLower(); $name = $Matches[2].Trim()
-    $fp = Join-Path $root.FullName $name
-    if (-not (Test-Path -LiteralPath $fp)) { Write-Host "    [!] нет файла $name" -ForegroundColor Red; $bad++; continue }
-    # LF-нормализация: архив отдаёт .ps1/.bat с CRLF, а суммы считаются без CR
-    $got = Get-NormalizedHash $fp
-    if ($got -ne $sum) { Write-Host "    [!] не сходится сумма: $name" -ForegroundColor Red; $bad++; continue }
-    $checked++
+    $idx++
+    $dst = Join-Path $newDir ("f$idx")
+    $esc = (($name -split '/') | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+    try {
+      Invoke-WebRequest -Uri "$rawBase/$esc`?nocache=$([DateTime]::UtcNow.Ticks)" -OutFile $dst -UseBasicParsing -TimeoutSec 60
+    } catch {
+      Write-Host "    [!] не скачался $name" -ForegroundColor Red; $bad++; continue
+    }
+    # LF-нормализация: в репозитории .ps1/.bat отдаются с CRLF, суммы считаются без CR
+    if ((Get-NormalizedHash $dst) -ne $sum) {
+      Write-Host "    [!] не сходится сумма: $name" -ForegroundColor Red; $bad++; continue
+    }
+    $queue += [pscustomobject]@{ Name = $name; Temp = $dst }
   }
-  if ($bad -gt 0 -or $checked -eq 0) {
+  if ($bad -gt 0 -or $queue.Count -eq 0) {
     Write-Host "  [!] Проверка не прошла ($bad ошибок). Ничего не меняю." -ForegroundColor Red
     Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
     return
   }
-  Write-Host "    [+] суммы сошлись: $checked файлов" -ForegroundColor Green
+  Write-Host "    [+] суммы сошлись: $($queue.Count) файлов" -ForegroundColor Green
 
-  # 3) проверяем, что новые скрипты вообще рабочие (синтаксис)
-  $newPs = Join-Path $root.FullName 'lan-win.ps1'
-  if (Test-Path $newPs) {
+  # 2) проверяем, что новые скрипты вообще рабочие (синтаксис)
+  $newPs = ($queue | Where-Object { $_.Name -eq 'lan-win.ps1' } | Select-Object -First 1)
+  if ($newPs) {
     $err = $null; $tok = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($newPs, [ref]$tok, [ref]$err) | Out-Null
+    [System.Management.Automation.Language.Parser]::ParseFile($newPs.Temp, [ref]$tok, [ref]$err) | Out-Null
     if ($err -and $err.Count -gt 0) {
       Write-Host "  [!] Новый lan-win.ps1 не разбирается — отменяю обновление." -ForegroundColor Red
       Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
@@ -1307,9 +1297,9 @@ function Do-Update {
   $bash = Get-Command bash -EA SilentlyContinue
   if ($bash) {
     foreach ($sh in @('lan-linux.sh','lan-android.sh','start-linux.sh')) {
-      $fp = Join-Path $root.FullName $sh
-      if (Test-Path $fp) {
-        & $bash.Source -n $fp 2>$null
+      $item = ($queue | Where-Object { $_.Name -eq $sh } | Select-Object -First 1)
+      if ($item) {
+        & $bash.Source -n $item.Temp 2>$null
         if ($LASTEXITCODE -ne 0) {
           Write-Host "  [!] Новый $sh с ошибкой синтаксиса — отменяю." -ForegroundColor Red
           Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
@@ -1319,7 +1309,7 @@ function Do-Update {
     }
   }
 
-  # 4) бэкап текущих файлов, затем замена
+  # 3) бэкап текущих файлов, затем замена
   $bk = Join-Path (Get-PeerFile "backup\$local-$(Get-Date -Format 'yyyyMMdd-HHmmss')")
   New-Item -ItemType Directory -Force -Path $bk | Out-Null
   Get-ChildItem $PSScriptRoot -File | Where-Object { $_.Name -notlike '.*' } |
@@ -1327,12 +1317,11 @@ function Do-Update {
   Write-Host "  Бэкап: $bk" -ForegroundColor Gray
 
   $n = 0
-  foreach ($f in (Get-ChildItem $root.FullName -File -Recurse)) {
-    $rel = $f.FullName.Substring($root.FullName.Length + 1)
-    if ($rel -match '^\.git') { continue }
-    $destDir = Split-Path (Join-Path $PSScriptRoot $rel) -Parent
+  foreach ($item in $queue) {
+    $dest = Join-Path $PSScriptRoot $item.Name
+    $destDir = Split-Path $dest -Parent
     if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
-    Copy-Item $f.FullName (Join-Path $PSScriptRoot $rel) -Force
+    Copy-Item $item.Temp $dest -Force
     $n++
   }
   Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
