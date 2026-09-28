@@ -589,6 +589,8 @@ http_get() {
 
 local_version() { [ -f "$LOCAL_DIR/VERSION" ] && tr -d ' \t\r\n' < "$LOCAL_DIR/VERSION" || echo "0.0.0"; }
 remote_version() { http_get "$RAW_BASE/VERSION?nocache=$(date +%s)" 2>/dev/null | tr -d ' \t\r\n'; }
+# точный коммит ветки: файлы по SHA неизменяемы, поэтому кэш CDN не подсунет старый набор
+remote_sha() { http_get "https://api.github.com/repos/$UPDATE_REPO/commits/$UPDATE_BRANCH" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4; }
 
 ver_newer() {
   [ "$1" = "$2" ] && return 1
@@ -626,8 +628,10 @@ do_update() {
   echo "  На GitHub          : $rv"
   if [ "$force" != "1" ] && ! ver_newer "$rv" "$lv"; then ok "обновление не нужно"; return 0; fi
   local tmp; tmp="$(mktemp -d)"
+  local ref; ref="$(remote_sha)"
+  if [ -n "$ref" ]; then echo "  Коммит: $(printf '%.7s' "$ref")"; else ref="$UPDATE_BRANCH"; fi
   echo "  Скачиваю архив..."
-  http_get "$TARBALL" "$tmp/lt.tar.gz" || { err "скачать не удалось"; rm -rf "$tmp"; return 1; }
+  http_get "https://codeload.github.com/$UPDATE_REPO/tar.gz/$ref" "$tmp/lt.tar.gz" || { err "скачать не удалось"; rm -rf "$tmp"; return 1; }
   tar -xzf "$tmp/lt.tar.gz" -C "$tmp" || { err "архив не распаковался"; rm -rf "$tmp"; return 1; }
   local root; root="$(find "$tmp" -maxdepth 1 -type d ! -path "$tmp" | head -1)"
   [ -n "$root" ] || { err "пустой архив"; rm -rf "$tmp"; return 1; }
@@ -651,7 +655,12 @@ do_update() {
     [ -f "$root/$f" ] && { bash -n "$root/$f" || { err "новый $f с ошибкой синтаксиса — отменяю"; rm -rf "$tmp"; return 1; }; }
   done
   local bk="$PEER_HOME/backup/$lv-$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$bk"; cp -a "$LOCAL_DIR"/. "$bk"/ 2>/dev/null; rm -rf "$bk/.git"
+  # без бэкапа не обновляемся: откатываться будет некуда
+  if ! mkdir -p "$bk" || ! cp -a "$LOCAL_DIR"/. "$bk"/ 2>/dev/null || [ -z "$(ls -A "$bk" 2>/dev/null)" ]; then
+    err "не смог сделать бэкап ($bk) — отменяю обновление"
+    rm -rf "$tmp"; return 1
+  fi
+  rm -rf "$bk/.git"
   echo "  Бэкап: $bk"
   local n=0
   while IFS= read -r f; do

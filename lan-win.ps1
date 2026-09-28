@@ -1198,6 +1198,18 @@ function Get-RemoteVersion([int]$TimeoutSec = 8) {
   if (-not $t) { return $null }
   return $t.Trim()
 }
+function Get-RemoteSha([int]$TimeoutSec = 10) {
+  # Точный коммит ветки через API. Файлы по SHA неизменяемы, поэтому CDN не может
+  # подсунуть набор из кэша на коммит старше (такое реально случалось).
+  $api = "https://api.github.com/repos/$UpdateRepo/commits/$UpdateBranch"
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $r = Invoke-RestMethod -Uri $api -UseBasicParsing -TimeoutSec $TimeoutSec `
+         -Headers @{ 'User-Agent' = 'lan-toolkit-updater'; 'Accept' = 'application/vnd.github+json' }
+    if ($r -and $r.sha) { return [string]$r.sha }
+    return $null
+  } catch { return $null }
+}
 
 function Do-UpdateCheck {
   param([switch]$Quiet)
@@ -1243,7 +1255,14 @@ function Do-Update {
   $newDir = Join-Path $tmp 'new'
   New-Item -ItemType Directory -Force -Path $newDir | Out-Null
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  $rawBase = "https://raw.githubusercontent.com/$UpdateRepo/$UpdateBranch"
+  $ref = Get-RemoteSha
+  if ($ref) {
+    Write-Host "  Коммит: $($ref.Substring(0, 7))" -ForegroundColor Gray
+  } else {
+    $ref = $UpdateBranch
+    Write-Host "  (точный коммит не узнал — беру ветку $UpdateBranch)" -ForegroundColor DarkGray
+  }
+  $rawBase = "https://raw.githubusercontent.com/$UpdateRepo/$ref"
 
   Write-Host "  Читаю список файлов..." -ForegroundColor Cyan
   $manLocal = Join-Path $tmp 'MANIFEST.txt'
@@ -1322,11 +1341,23 @@ function Do-Update {
     Write-Host "  (bash не найден — синтаксис .sh пропускаю)" -ForegroundColor DarkGray
   }
 
-  # 3) бэкап текущих файлов, затем замена
-  $bk = Join-Path (Get-PeerFile "backup\$local-$(Get-Date -Format 'yyyyMMdd-HHmmss')")
-  New-Item -ItemType Directory -Force -Path $bk | Out-Null
-  Get-ChildItem $PSScriptRoot -File | Where-Object { $_.Name -notlike '.*' } |
-    ForEach-Object { Copy-Item $_.FullName (Join-Path $bk $_.Name) -Force }
+  # 3) бэкап текущих файлов — обязательный шаг: без него обновление не делаем
+  $bk = Get-PeerFile "backup\$local-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+  try {
+    New-Item -ItemType Directory -Force -Path $bk -ErrorAction Stop | Out-Null
+    Get-ChildItem $PSScriptRoot -File | Where-Object { $_.Name -notlike '.*' } |
+      ForEach-Object { Copy-Item $_.FullName (Join-Path $bk $_.Name) -Force -ErrorAction Stop }
+  } catch {
+    Write-Host "  [!] Не смог сделать бэкап: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "      Отменяю обновление — без копии откатываться будет некуда." -ForegroundColor Red
+    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+    return
+  }
+  if ((Get-ChildItem $bk -File -EA SilentlyContinue).Count -eq 0) {
+    Write-Host "  [!] Бэкап пустой ($bk) — отменяю обновление." -ForegroundColor Red
+    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+    return
+  }
   Write-Host "  Бэкап: $bk" -ForegroundColor Gray
 
   $n = 0
