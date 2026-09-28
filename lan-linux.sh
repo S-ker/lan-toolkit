@@ -87,7 +87,7 @@ do_setup() {
   done
 
   echo "[3] Файрвол"
-  fw_open 445/tcp 139/tcp 137/udp 138/udp 22/tcp 5353/udp "$PORT/tcp"
+  fw_open 445/tcp 139/tcp 137/udp 138/udp 22/tcp 5353/udp 4445/udp "$PORT/tcp"
 
   echo "[4] SMB-шара"
   do_share silent
@@ -261,6 +261,168 @@ EOF
   echo "  Кросс-плей Java<->Bedrock: плагины Geyser + Floodgate в plugins/"
 }
 
+# ---------- Minecraft: LAN-сессия клиента ----------
+mc_worlds_list() {
+  local roots=(
+    "$HOME/.minecraft/saves"
+    "$HOME/.local/share/PrismLauncher/instances"
+    "$HOME/.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances"
+    "$HOME/.local/share/multimc/instances"
+    "$HOME/.local/share/MultiMC/instances"
+    "$MC_DIR"
+  )
+  local r inst w
+  for r in "${roots[@]}"; do
+    [ -d "$r" ] || continue
+    if ls "$r"/*/.minecraft/saves >/dev/null 2>&1; then
+      for inst in "$r"/*; do
+        [ -d "$inst/.minecraft/saves" ] || continue
+        for w in "$inst"/.minecraft/saves/*; do
+          [ -f "$w/level.dat" ] || continue
+          printf '%s\t%s\t%s\n' "$(basename "$w")" "$w" "$(basename "$inst")"
+        done
+      done
+    else
+      for w in "$r"/*/; do
+        [ -f "${w}level.dat" ] || continue
+        printf '%s\t%s\t%s\n' "$(basename "$w")" "${w%/}" "local"
+      done
+    fi
+  done
+  return 0
+}
+
+do_detect() {
+  hdr "Поиск запущенного Minecraft (клиент-клиент, «Открыть для сети»)"
+  local pids p cl inst ver ports port out any=0
+  pids="$(pgrep -f 'net\.minecraft' 2>/dev/null | tr '\n' ' ')"
+  [ -z "$pids" ] && warn "Minecraft сейчас не запущен"
+  for p in $pids; do
+    [ -r "/proc/$p/cmdline" ] || continue
+    cl="$(tr '\0' ' ' < "/proc/$p/cmdline")"
+    case "$cl" in *java*) ;; *) continue ;; esac
+    inst="$(echo "$cl" | grep -oE 'instances/[^/ ]+' | head -1 | cut -d/ -f2)"
+    ver="$(echo "$cl"  | grep -oE 'minecraft-[0-9][^/ ;]*-client\.jar' | head -1 | sed 's/minecraft-//;s/-client\.jar//')"
+    echo ""
+    ok "КЛИЕНТ (игра) PID $p${inst:+   инстанс: $inst}${ver:+   версия: $ver}"
+    ports="$(ss -tlnpH 2>/dev/null | grep "pid=$p," | awk '{print $4}' | sed 's/.*://' | sort -u)"
+    [ -z "$ports" ] && ports="$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u | grep -E '^[0-9]{4,5}$')"
+    for port in $ports; do
+      out="$(python3 "$(dirname "$0")/mcping.py" ping 127.0.0.1 "$port" 2>/dev/null)"
+      case "$out" in
+        *"OK=yes"*)
+          any=1
+          echo -e "    ${C_G}ЛОКАЛЬНАЯ СЕТЬ ОТКРЫТА -> порт $port${C_0}"
+          echo "$out" | sed -n 's/^MOTD=/      Мир     : /p;s/^VERSION=/      Версия  : /p;s/^PLAYERS=/      Игроки  : /p;s/^WHO=/      В игре  : /p'
+          fw_open "$port/tcp"
+          echo "      Адрес для друзей:"
+          show_ip | sed 's/^   -> /        /'
+          ;;
+      esac
+    done
+    if [ -z "$ports" ]; then
+      warn "LAN не открыт. В игре: Esc -> «Открыть для сети» (Open to LAN)"
+    fi
+  done
+
+  echo ""
+  echo "  --- Поиск чужих LAN-игр (мультикаст 224.0.2.60) ---"
+  command -v python3 >/dev/null 2>&1 && python3 "$(dirname "$0")/mcping.py" listen 4 2>/dev/null | sed -n 's/^HUMAN=/    /p'
+  [ "$any" = 1 ] && echo -e "\n  ${C_G}Друзья: Multiplayer -> Direct Connection -> <IP>:<порт выше>${C_0}"
+  return 0
+}
+
+# ---------- Minecraft: миры ----------
+do_world() {
+  local mode="${1:-list}"; local want="${2:-}"
+  local remote="${3:-$SHARE_DIR/mcworlds}"
+  hdr "Minecraft: миры"
+
+  if [ "$mode" = "list" ]; then
+    local n=0 name path inst busy
+    while IFS=$'\t' read -r name path inst; do
+      n=$((n+1)); busy=""
+      if [ -f "$path/session.lock" ] && fuser "$path/session.lock" >/dev/null 2>&1; then busy=" [ЗАНЯТ игрой]"; fi
+      printf '  %2d) %s  (%s)%s\n      %s\n' "$n" "$name" "$inst" "$busy" "$path"
+    done < <(mc_worlds_list)
+    [ "$n" = 0 ] && warn "миры не найдены"
+    echo ""
+    echo "  Синхронизация: sudo bash $0 world sync \"имя мира\" /путь/общей/папки"
+    return 0
+  fi
+
+  local sel_name="" sel_path="" sel_inst=""
+  while IFS=$'\t' read -r name path inst; do
+    if [ -z "$want" ] || [ "$name" = "$want" ] || [ "${name#*"$want"}" != "$name" ]; then
+      sel_name="$name"; sel_path="$path"; sel_inst="$inst"; break
+    fi
+  done < <(mc_worlds_list)
+  [ -z "$sel_path" ] && { err "мир не найден${want:+: $want}"; return 1; }
+
+  ok "мир: $sel_name"
+  echo "     $sel_path"
+  if [ -f "$sel_path/session.lock" ] && fuser "$sel_path/session.lock" >/dev/null 2>&1; then
+    warn "мир сейчас используется игрой — закрой Minecraft"
+    [ "${FORCE:-0}" = "1" ] || return 1
+  fi
+
+  mkdir -p "$remote"
+  local dest="$remote/$sel_name"
+
+  if [ "${NOBACKUP:-0}" != "1" ]; then
+    mkdir -p "$remote/_backups"
+    local bz="$remote/_backups/$(echo "$sel_name" | tr -c 'A-Za-z0-9_.-' '_')-$(date +%Y%m%d-%H%M%S).tar.gz"
+    ok "бэкап: $bz"
+    tar -czf "$bz" -C "$sel_path" . 2>/dev/null || warn "бэкап не сделался"
+  fi
+
+  command -v rsync >/dev/null 2>&1 || pkg_install rsync
+  local ROPTS=(-a --update --exclude=session.lock)
+  if [ "$mode" = "push" ] || [ "$mode" = "sync" ]; then
+    echo "  Отдаю мир в общую папку..."
+    rsync "${ROPTS[@]}" "$sel_path/" "$dest/" && ok "готово -> $dest"
+  fi
+  if [ "$mode" = "pull" ] || [ "$mode" = "sync" ]; then
+    [ -d "$dest" ] || { err "в общей папке нет мира '$sel_name'"; return 1; }
+    echo "  Забираю мир из общей папки..."
+    rsync "${ROPTS[@]}" "$dest/" "$sel_path/" && ok "готово -> $sel_path"
+  fi
+  [ "$mode" = "backup" ] && ok "бэкап готов"
+  return 0
+}
+
+# ---------- Двусторонний обмен папками ----------
+do_sync() {
+  local local_dir="${1:-$SHARE_DIR}" remote_dir="${2:-}" watch="${3:-0}"
+  [ -n "$remote_dir" ] || { err "укажи: bash $0 sync <локальная папка> <папка-на-той-стороне> [секунды]"; return 1; }
+  command -v rsync >/dev/null 2>&1 || pkg_install rsync
+  mkdir -p "$local_dir"
+  hdr "Двусторонний обмен"
+  echo "  Локально : $local_dir"
+  echo "  Удалённо : $remote_dir"
+  local ROPTS
+  if [ "${MIRROR:-0}" = "1" ]; then
+    warn "режим ЗЕРКАЛО: лишние файлы удаляются с обеих сторон"
+    ROPTS=(-a --update --delete)
+  else
+    ok "безопасный режим: новее побеждает, ничего не удаляется"
+    ROPTS=(-a --update)
+  fi
+  while true; do
+    echo "  [$(date +%H:%M:%S)] туда..."
+    rsync "${ROPTS[@]}" "$local_dir/" "$remote_dir/" && echo "     ок"
+    echo "  [$(date +%H:%M:%S)] обратно..."
+    rsync "${ROPTS[@]}" "$remote_dir/" "$local_dir/" && echo "     ок"
+    if [ "$watch" != "0" ] && [ "$watch" -gt 0 ] 2>/dev/null; then
+      echo "  ... следующая синхронизация через $watch сек. (Ctrl+C — стоп)"
+      sleep "$watch"
+    else
+      echo "  Один проход. Для постоянного обмена добавь секунды (например 30)."
+      break
+    fi
+  done
+}
+
 # ---------- status ----------
 do_status() {
   hdr "status"
@@ -289,7 +451,10 @@ case "${1:-setup}" in
   mount)  do_mount "${@:2}" ;;
   ssh)    do_ssh "${@:2}" ;;
   mc|minecraft) do_mc "${@:2}" ;;
+  detect|lan)   do_detect ;;
+  world)        do_world "${@:2}" ;;
+  sync)         do_sync "${@:2}" ;;
   status) do_status ;;
   remove) do_remove "${@:2}" ;;
-  *) echo "usage: $0 {setup|share|http|mount|ssh|mc [java|bedrock|firewall|join]|status|remove}"; exit 1 ;;
+  *) echo "usage: $0 {setup|share|http|mount|ssh|mc [java|bedrock|firewall|join]|detect|world [list|push|pull|sync|backup]|sync <local> <remote> [sec]|status|remove}"; exit 1 ;;
 esac

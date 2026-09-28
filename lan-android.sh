@@ -169,6 +169,80 @@ EOF
   esac
 }
 
+# ---------- Поиск игр в сети (телефон как клиент) ----------
+do_scan() {
+  local prefix="${1:-}"
+  command -v python >/dev/null 2>&1 || pkg_install python
+  if [ -z "$prefix" ]; then
+    local ip; ip="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127' | head -1)"
+    prefix="$(echo "$ip" | cut -d. -f1-3)"
+  fi
+  hdr "Сканирую $prefix.0/24 на Minecraft-серверы (порт 25565)"
+  python "$(dirname "$0")/mcping.py" scan "$prefix" 25565
+  echo ""
+  hdr "Ищу LAN-игры в сети (224.0.2.60, «Открыть для сети»)"
+  python "$(dirname "$0")/mcping.py" listen 6
+  echo ""
+  echo "  Дальше: Java -> Direct Connection / Bedrock -> Add Server, адрес из строк выше."
+  echo "  Нестандартный порт: bash $0 scan-ping <IP> <порт>"
+}
+
+do_scanping() {
+  local ip="${1:-}" port="${2:-25565}"
+  [ -n "$ip" ] || { err "укажи: bash $0 scan-ping <IP> <порт>"; return 1; }
+  command -v python >/dev/null 2>&1 || pkg_install python
+  python "$(dirname "$0")/mcping.py" ping "$ip" "$port" || python "$(dirname "$0")/mcping.py" bedrock "$ip" "$port"
+}
+
+# ---------- Миры и двусторонний обмен (через SSH на ПК) ----------
+do_world() {
+  local mode="${1:-list}" world="${2:-}" dest="${3:-}"
+  hdr "Minecraft: миры на телефоне"
+  local n=0 w
+  for w in ~/mc/world ~/mc/world_* "$STORE/games/com.mojang/minecraftWorlds"/*; do
+    [ -d "$w" ] || continue
+    { [ -f "$w/level.dat" ] || [ -f "$w/levelname.txt" ]; } || continue
+    n=$((n+1)); printf '  %2d) %s\n      %s\n' "$n" "$(basename "$w")" "$w"
+  done
+  [ "$n" = 0 ] && warn "миры не найдены (Bedrock-миры: $STORE/games/com.mojang/minecraftWorlds)"
+  [ "$mode" = "list" ] && return 0
+
+  [ -n "$world" ] || { err "укажи мир: bash $0 world $mode <путь-к-миру> user@IP:/путь"; return 1; }
+  [ -n "$dest" ] || { err "укажи получателя: user@IP:/путь/общей/папки"; return 1; }
+  pkg_install rsync openssh >/dev/null 2>&1
+  local ROPTS=(-a --update --exclude=session.lock --progress)
+  if [ "$mode" = "push" ] || [ "$mode" = "sync" ]; then
+    echo "  Отдаю мир на ПК..."; rsync "${ROPTS[@]}" "$world/" "$dest/$(basename "$world")/" && ok "готово"
+  fi
+  if [ "$mode" = "pull" ] || [ "$mode" = "sync" ]; then
+    echo "  Забираю мир с ПК..."; rsync "${ROPTS[@]}" "$dest/$(basename "$world")/" "$world/" && ok "готово"
+  fi
+  echo "  Bedrock-миры на телефоне: GUI-клиент или HTTP-обмен (bash $0 http)"
+}
+
+do_sync() {
+  local local_dir="${1:-$STORE/Download}" remote_dir="${2:-}" watch="${3:-0}"
+  [ -n "$remote_dir" ] || { err "укажи: bash $0 sync <локальная папка> user@IP:/путь [секунды]"; return 1; }
+  pkg_install rsync openssh >/dev/null 2>&1
+  mkdir -p "$local_dir"
+  hdr "Двусторонний обмен с ПК"
+  echo "  Телефон : $local_dir"
+  echo "  ПК      : $remote_dir"
+  local ROPTS=(-a --update)
+  if [ "${MIRROR:-0}" = "1" ]; then warn "режим ЗЕРКАЛО: лишнее удаляется"; ROPTS=(-a --update --delete); fi
+  while true; do
+    echo "  [$(date +%H:%M:%S)] туда..."
+    rsync "${ROPTS[@]}" "$local_dir/" "$remote_dir/" && echo "     ок"
+    echo "  [$(date +%H:%M:%S)] обратно..."
+    rsync "${ROPTS[@]}" "$remote_dir/" "$local_dir/" && echo "     ок"
+    if [ "$watch" != "0" ] && [ "$watch" -gt 0 ] 2>/dev/null; then
+      echo "  ... через $watch сек. (Ctrl+C — стоп)"; sleep "$watch"
+    else
+      echo "  Один проход. Для постоянного обмена добавь секунды."; break
+    fi
+  done
+}
+
 # ================= ПРОСТОЕ МЕНЮ =================
 do_menu() {
   while true; do
@@ -184,7 +258,10 @@ do_menu() {
     echo "   4  Скачать файл с ПК (браузерная раздача)"
     echo -e "   5  ${C_G}Minecraft: как подключиться к серверу${C_0}"
     echo -e "   6  ${C_G}Minecraft: сервер на телефоне (для 1-2 человек)${C_0}"
-    echo "   7  Включить SSH-сервер (заход с ПК на телефон)"
+    echo -e "   7  ${C_G}Minecraft: найти игру в сети (скан + LAN-поиск)${C_0}"
+    echo -e "   8  ${C_G}Minecraft: перенести/синхронизировать мир${C_0}"
+    echo "   9  Двусторонняя папка-обмен с ПК (по SSH)"
+    echo "  10  Включить SSH-сервер (заход с ПК на телефон)"
     echo "   0  Выход"
     echo ""
     read -rp "  Введи цифру и нажми Enter: " c
@@ -195,7 +272,20 @@ do_menu() {
       4) read -rp "  Вставь ссылку (http://...): " u; do_get "$u"; echo; read -rp "  Enter -> назад" ;;
       5) do_mc join; echo; read -rp "  Enter -> назад в меню" ;;
       6) do_mc server; echo; read -rp "  Enter -> назад в меню" ;;
-      7) do_ssh; echo; read -rp "  Enter -> назад в меню" ;;
+      7) do_scan; echo; read -rp "  Enter -> назад в меню" ;;
+      8)
+         do_world list; echo
+         read -rp "  Путь к миру: " w
+         read -rp "  Куда (user@IP:/путь): " d
+         read -rp "  [1] отдать [2] забрать [3] синхронизировать (Enter=3): " m
+         case "$m" in 1) m=push ;; 2) m=pull ;; *) m=sync ;; esac
+         do_world "$m" "$w" "$d"; echo; read -rp "  Enter -> назад в меню" ;;
+      9)
+         read -rp "  Локальная папка (Enter = Download): " ld
+         read -rp "  Папка на ПК (user@IP:/путь): " rd
+         read -rp "  Обновлять каждые N секунд? (Enter = один раз): " sec
+         do_sync "${ld:-}" "$rd" "${sec:-0}"; echo; read -rp "  Enter -> назад в меню" ;;
+      10) do_ssh; echo; read -rp "  Enter -> назад в меню" ;;
       0) exit 0 ;;
       *) echo "  Не понял. Введи цифру из списка."; sleep 2 ;;
     esac
@@ -210,6 +300,10 @@ case "${1:-menu}" in
   get)    do_get "${@:2}" ;;
   mount)  do_mount "${@:2}" ;;
   mc|minecraft) do_mc "${@:2}" ;;
+  scan)   do_scan "${@:2}" ;;
+  scan-ping) do_scanping "${@:2}" ;;
+  world)  do_world "${@:2}" ;;
+  sync)   do_sync "${@:2}" ;;
   status) do_status ;;
-  *) echo "usage: $0 {setup|ssh|http|get|mount|mc [join|server]|status}"; exit 1 ;;
+  *) echo "usage: $0 {setup|ssh|http|get|mount|mc [join|server]|scan [prefix]|scan-ping <IP> [port]|world [list|push|pull|sync] <path> <user@IP:/dir>|sync <local> <user@IP:/dir> [sec]|status}"; exit 1 ;;
 esac
