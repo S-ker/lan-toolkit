@@ -1,0 +1,6 @@
+# служебное
+__pycache__/
+*.pyc
+*.zip
+*.tar.gz
+_backups/
