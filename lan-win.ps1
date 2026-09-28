@@ -20,7 +20,8 @@
 param(
   [ValidateSet('setup','status','http','hotspot','mount','unmount','remove','minecraft','mc','menu','detect','world','sync',
                'peer-keygen','peer-add','peer-list','peer-forget','peer-arm','peer-disarm','peer-test','peer-bootstrap',
-               'peer-run','peer-sync','peer-serve','peer-log')]
+               'peer-run','peer-sync','peer-serve','peer-log',
+               'update','update-check','update-manifest','rollback','no-update')]
   [string]$Action = 'menu',
 
   [string]$ShareName = 'LAN',
@@ -57,6 +58,10 @@ param(
   [string]$RequestFile = '',
   [switch]$Once,
   [switch]$AllowVersionDrift,
+  # --- автообновление ---
+  [string]$UpdateRepo = 'S-ker/lan-toolkit',
+  [string]$UpdateBranch = 'main',
+  [switch]$NoUpdateCheck,
   [switch]$On
 )
 
@@ -1148,6 +1153,210 @@ function Do-PeerServe {
   if ($RequestFile -and (Test-Path $RequestFile)) { Remove-Item $RequestFile -Force -ErrorAction SilentlyContinue }
 }
 
+# ================= АВТООБНОВЛЕНИЕ ИЗ GITHUB =================
+# Версия лежит в файле VERSION, содержимое — в MANIFEST.txt (sha256 по каждому файлу).
+# Порядок: узнать версию -> скачать архив -> ПРОВЕРИТЬ сумму и синтаксис -> бэкап -> замена.
+# Ничего не заменяется, пока новый набор файлов не проверен целиком.
+
+function Get-LocalVersion {
+  $f = Join-Path $PSScriptRoot 'VERSION'
+  if (Test-Path $f) { return (Get-Content $f -Raw -Encoding UTF8).Trim() }
+  return '0.0.0'
+}
+function Compare-VersionNewer([string]$remote, [string]$local) {
+  try { return ([version]$remote -gt [version]$local) } catch { return ($remote -ne $local) }
+}
+function Test-UpdateAllowed {
+  return -not (Test-Path (Get-PeerFile 'noupdate'))
+}
+function Get-RemoteFileText([string]$path, [int]$TimeoutSec = 8) {
+  $url = "https://raw.githubusercontent.com/$UpdateRepo/$UpdateBranch/$path"
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec $TimeoutSec
+    return $r.Content
+  } catch { return $null }
+}
+function Get-RemoteVersion([int]$TimeoutSec = 8) {
+  $t = Get-RemoteFileText 'VERSION' $TimeoutSec
+  if (-not $t) { return $null }
+  return $t.Trim()
+}
+
+function Do-UpdateCheck {
+  param([switch]$Quiet)
+  $local = Get-LocalVersion
+  $remote = Get-RemoteVersion $(if ($Quiet) { 3 } else { 8 })
+  if (-not $remote) {
+    if (-not $Quiet) { Write-Host "  Проверить не удалось (нет интернета?) — работаю как есть." -ForegroundColor Yellow }
+    return $null
+  }
+  if (Compare-VersionNewer $remote $local) {
+    if (-not $Quiet) {
+      Write-Host "  Доступна новая версия: $remote (у тебя $local)" -ForegroundColor Green
+      Write-Host "  Обновить: пункт 16 меню или -Action update" -ForegroundColor Gray
+    }
+    return $remote
+  }
+  if (-not $Quiet) { Write-Host "  Версия $local — самая свежая." -ForegroundColor Green }
+  return ''
+}
+
+function Do-Update {
+  param([switch]$Force)
+  $local = Get-LocalVersion
+  Write-Host "`n=== Обновление ===" -ForegroundColor Cyan
+  Write-Host "  Сейчас установлено: $local"
+
+  $remote = Get-RemoteVersion 10
+  if (-not $remote) {
+    Write-Host "  [!] Не смог узнать версию на GitHub. Проверь интернет." -ForegroundColor Red
+    return
+  }
+  Write-Host "  На GitHub          : $remote"
+  if (-not $Force -and -not (Compare-VersionNewer $remote $local)) {
+    Write-Host "  Обновление не нужно." -ForegroundColor Green
+    return
+  }
+
+  # 1) скачиваем архив во временную папку — рабочую копию пока не трогаем
+  $tmp = Join-Path $env:TEMP ('lt-upd-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  $tgz = Join-Path $tmp 'lt.tar.gz'
+  $url = "https://codeload.github.com/$UpdateRepo/tar.gz/refs/heads/$UpdateBranch"
+  Write-Host "  Скачиваю архив..." -ForegroundColor Cyan
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $url -OutFile $tgz -UseBasicParsing -TimeoutSec 120
+  } catch {
+    Write-Host "  [!] Скачать не удалось: $($_.Exception.Message)" -ForegroundColor Red
+    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+    return
+  }
+
+  $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+  if (-not (Test-Path $tar)) {
+    Write-Host "  [!] Нет tar.exe (нужен Windows 10 1803+). Обнови вручную: git clone репозитория." -ForegroundColor Red
+    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+    return
+  }
+  & $tar -xzf $tgz -C $tmp 2>$null
+  $root = Get-ChildItem $tmp -Directory | Select-Object -First 1
+  if (-not $root) {
+    Write-Host "  [!] Архив распаковался пустым." -ForegroundColor Red
+    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+    return
+  }
+  Write-Host "  Проверяю содержимое..." -ForegroundColor Cyan
+
+  # 2) сверяем sha256 каждого файла с MANIFEST.txt из репозитория
+  $manifest = Get-RemoteFileText 'MANIFEST.txt' 15
+  if (-not $manifest) {
+    Write-Host "  [!] Нет MANIFEST.txt — не могу проверить целостность, отменяю." -ForegroundColor Red
+    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+    return
+  }
+  $bad = 0; $checked = 0
+  foreach ($line in ($manifest -split "`r?`n")) {
+    if ($line -notmatch '^([0-9a-fA-F]{64})\s+(.+)$') { continue }
+    $sum = $Matches[1].ToLower(); $name = $Matches[2].Trim()
+    $fp = Join-Path $root.FullName $name
+    if (-not (Test-Path $fp)) { Write-Host "    [!] нет файла $name" -ForegroundColor Red; $bad++; continue }
+    $got = (Get-FileHash -Algorithm SHA256 -Path $fp).Hash.ToLower()
+    if ($got -ne $sum) { Write-Host "    [!] не сходится сумма: $name" -ForegroundColor Red; $bad++; continue }
+    $checked++
+  }
+  if ($bad -gt 0 -or $checked -eq 0) {
+    Write-Host "  [!] Проверка не прошла ($bad ошибок). Ничего не меняю." -ForegroundColor Red
+    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+    return
+  }
+  Write-Host "    [+] суммы сошлись: $checked файлов" -ForegroundColor Green
+
+  # 3) проверяем, что новые скрипты вообще рабочие (синтаксис)
+  $newPs = Join-Path $root.FullName 'lan-win.ps1'
+  if (Test-Path $newPs) {
+    $err = $null; $tok = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($newPs, [ref]$tok, [ref]$err) | Out-Null
+    if ($err -and $err.Count -gt 0) {
+      Write-Host "  [!] Новый lan-win.ps1 не разбирается — отменяю обновление." -ForegroundColor Red
+      Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+      return
+    }
+  }
+  $bash = Get-Command bash -EA SilentlyContinue
+  if ($bash) {
+    foreach ($sh in @('lan-linux.sh','lan-android.sh','start-linux.sh')) {
+      $fp = Join-Path $root.FullName $sh
+      if (Test-Path $fp) {
+        & $bash.Source -n $fp 2>$null
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "  [!] Новый $sh с ошибкой синтаксиса — отменяю." -ForegroundColor Red
+          Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+          return
+        }
+      }
+    }
+  }
+
+  # 4) бэкап текущих файлов, затем замена
+  $bk = Join-Path (Get-PeerFile "backup\$local-$(Get-Date -Format 'yyyyMMdd-HHmmss')")
+  New-Item -ItemType Directory -Force -Path $bk | Out-Null
+  Get-ChildItem $PSScriptRoot -File | Where-Object { $_.Name -notlike '.*' } |
+    ForEach-Object { Copy-Item $_.FullName (Join-Path $bk $_.Name) -Force }
+  Write-Host "  Бэкап: $bk" -ForegroundColor Gray
+
+  $n = 0
+  foreach ($f in (Get-ChildItem $root.FullName -File -Recurse)) {
+    $rel = $f.FullName.Substring($root.FullName.Length + 1)
+    if ($rel -match '^\.git') { continue }
+    $destDir = Split-Path (Join-Path $PSScriptRoot $rel) -Parent
+    if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+    Copy-Item $f.FullName (Join-Path $PSScriptRoot $rel) -Force
+    $n++
+  }
+  Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+  Write-PeerAudit "update $local -> $remote ($n файлов)"
+  Write-Host "`n  [+] Обновлено до $remote (файлов: $n)" -ForegroundColor Green
+  Write-Host "      Откатить: .\lan-win.ps1 rollback" -ForegroundColor Gray
+  Write-Host "      Вторую машину тоже обнови — иначе режим «партнёр» откажет по хешу." -ForegroundColor Yellow
+}
+
+function New-Manifest {
+  $names = @('VERSION','lan-win.ps1','lan-linux.sh','lan-android.sh','mcping.py',
+             'start-linux.sh','START-Windows.bat','НАЧАТЬ-Windows.bat','НАЧАТЬ-Linux.desktop',
+             'README.md','.gitattributes','.gitignore')
+  $lines = New-Object Collections.Generic.List[string]
+  foreach ($n in $names) {
+    $fp = Join-Path $PSScriptRoot $n
+    if (Test-Path $fp) {
+      $lines.Add(((Get-FileHash -Algorithm SHA256 -Path $fp).Hash.ToLower() + '  ' + $n))
+    }
+  }
+  $out = Join-Path $PSScriptRoot 'MANIFEST.txt'
+  [IO.File]::WriteAllText($out, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+  Write-Host "[+] MANIFEST.txt обновлён: $($lines.Count) файлов" -ForegroundColor Green
+}
+
+function New-Rollback {
+  $base = Get-PeerFile 'backup'
+  if (-not (Test-Path $base)) { Write-Host "Бэкапов нет." -ForegroundColor Yellow; return }
+  $last = Get-ChildItem $base -Directory | Sort-Object Name -Descending | Select-Object -First 1
+  if (-not $last) { Write-Host "Бэкапов нет." -ForegroundColor Yellow; return }
+  Write-Host "Откатываю из $($last.FullName)..." -ForegroundColor Cyan
+  $n = 0
+  foreach ($f in (Get-ChildItem $last.FullName -File)) {
+    Copy-Item $f.FullName (Join-Path $PSScriptRoot $f.Name) -Force; $n++
+  }
+  Write-PeerAudit "rollback из $($last.Name) ($n файлов)"
+  Write-Host "[+] Восстановлено файлов: $n (версия $(Get-LocalVersion))" -ForegroundColor Green
+}
+
+function Disable-UpdateCheck {
+  'noupdate' | Set-Content -Path (Get-PeerFile 'noupdate') -Encoding UTF8
+  Write-Host "[-] Проверка обновлений при запуске меню выключена." -ForegroundColor Green
+}
+
 # ================= ПРОСТОЕ МЕНЮ (для тех, кто не любит командную строку) =================
 function Start-Action([string]$act, [string]$extra, [switch]$AsAdmin) {
   $exe = (Get-Process -Id $PID).Path
@@ -1161,12 +1370,21 @@ function Start-Action([string]$act, [string]$extra, [switch]$AsAdmin) {
 }
 
 function Do-Menu {
+  # один раз за запуск: тихая проверка обновлений (можно выключить: -Action no-update)
+  $script:UpdateOffer = ''
+  if (-not $NoUpdateCheck -and (Test-UpdateAllowed)) {
+    Write-Host "  Проверяю обновления..." -ForegroundColor DarkGray
+    $script:UpdateOffer = Do-UpdateCheck -Quiet
+  }
   while ($true) {
     Clear-Host
     Write-Host ""
     Write-Host "  ==============================================================" -ForegroundColor Cyan
-    Write-Host "        ЛОКАЛЬНАЯ СЕТЬ + MINECRAFT   (Windows)                  " -ForegroundColor Cyan
+    Write-Host "        ЛОКАЛЬНАЯ СЕТЬ + MINECRAFT   (Windows)   v$(Get-LocalVersion)" -ForegroundColor Cyan
     Write-Host "  ==============================================================" -ForegroundColor Cyan
+    if ($script:UpdateOffer) {
+      Write-Host "   >>> ДОСТУПНО ОБНОВЛЕНИЕ $($script:UpdateOffer) — пункт 16 <<<" -ForegroundColor Green
+    }
     Write-Host ""
     Write-Host "   1  Подготовить сеть (папка обмена + видимость в сети)" -ForegroundColor White
     Write-Host "   2  Показать мои адреса и состояние" -ForegroundColor White
@@ -1182,6 +1400,7 @@ function Do-Menu {
     Write-Host "  13  Разрешить приём с другой машины на N минут (взвести)" -ForegroundColor Magenta
     Write-Host "  14  Синхронизация с партнёром по SSH (обе стороны сами)" -ForegroundColor Magenta
     Write-Host "  15  Журнал удалённых действий" -ForegroundColor DarkGray
+    Write-Host "  16  Проверить и установить обновление" -ForegroundColor Cyan
     Write-Host "   8  Убрать все настройки этой программы" -ForegroundColor DarkGray
     Write-Host "   0  Выход" -ForegroundColor DarkGray
     Write-Host ""
@@ -1262,6 +1481,10 @@ function Do-Menu {
         }
       }
       '15' { Do-PeerLog }
+      '16' {
+        Do-Update
+        $script:UpdateOffer = ''
+      }
       '10' {
         Write-Host "  Сначала посмотри список миров:"
         Start-Action 'world' '-WorldMode list' -AsAdmin
@@ -1290,7 +1513,7 @@ function Do-Menu {
       '0' { return }
       default { Write-Host "  Не понял. Введи цифру из списка." -ForegroundColor Yellow; Start-Sleep 2 }
     }
-    if ($c -in '1','2','3','4','5','7','8','9','10','11','12','13','14','15') {
+    if ($c -in '1','2','3','4','5','7','8','9','10','11','12','13','14','15','16') {
       Write-Host ""
       Read-Host "  Готово. Нажми Enter, чтобы вернуться в меню"
     }
@@ -1323,4 +1546,9 @@ switch ($Action) {
   'peer-sync'      { Do-PeerSync }
   'peer-serve'     { Do-PeerServe -RequestFile $RequestFile }
   'peer-log'       { Do-PeerLog }
+  'update'         { Do-Update }
+  'update-check'   { Do-UpdateCheck | Out-Null }
+  'update-manifest'{ New-Manifest }
+  'rollback'       { New-Rollback }
+  'no-update'      { Disable-UpdateCheck }
 }

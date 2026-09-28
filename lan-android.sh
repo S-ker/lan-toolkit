@@ -245,12 +245,20 @@ do_sync() {
 
 # ================= ПРОСТОЕ МЕНЮ =================
 do_menu() {
+  # тихая проверка обновлений один раз за запуск
+  UPDATE_OFFER=""
+  if [ "${NOUPDATECHECK:-0}" != "1" ] && [ ! -f "$PEER_HOME/noupdate" ]; then
+    if do_update_check 1 >/dev/null 2>&1; then UPDATE_OFFER=1; fi
+  fi
   while true; do
     clear 2>/dev/null
     echo ""
     echo -e "  ${C_C}================================================${C_0}"
     echo -e "  ${C_C}   ТЕЛЕФОН: СЕТЬ + MINECRAFT (Termux)          ${C_0}"
     echo -e "  ${C_C}================================================${C_0}"
+    if [ -n "$UPDATE_OFFER" ]; then
+      echo -e "  ${C_G}>>> ДОСТУПНО ОБНОВЛЕНИЕ — пункт 14 <<<${C_0}"
+    fi
     echo ""
     echo "   1  Первая настройка (SSH, файлы, доступ к памяти)"
     echo "   2  Показать мой IP на телефоне"
@@ -265,6 +273,7 @@ do_menu() {
     echo -e "  11  ${C_Y}Разрешить приём синхронизации с ПК на N минут (взвести)${C_0}"
     echo -e "  12  ${C_Y}Синхронизация с партнёром по SSH (телефон сам)${C_0}"
     echo "  13  Журнал удалённых действий"
+    echo -e "  14  ${C_C}Проверить и установить обновление${C_0} (v$(local_version))"
     echo "   0  Выход"
     echo ""
     read -rp "  Введи цифру и нажми Enter: " c
@@ -311,6 +320,12 @@ do_menu() {
          fi
          echo; read -rp "  Enter -> назад в меню" ;;
       13) peer_log; echo; read -rp "  Enter -> назад в меню" ;;
+      14)
+         do_update_check
+         echo
+         read -rp "  Установить обновление сейчас? [y/N]: " yn
+         [ "$yn" = "y" ] && { do_update; echo; read -rp "  Готово. Enter -> назад в меню"; } 
+         ;;
       0) exit 0 ;;
       *) echo "  Не понял. Введи цифру из списка."; sleep 2 ;;
     esac
@@ -552,6 +567,110 @@ peer_log() {
   [ -f "$PEER_HOME/audit.log" ] && tail -40 "$PEER_HOME/audit.log" || echo "журнал пуст"
 }
 
+# ============================================================
+#  АВТООБНОВЛЕНИЕ ИЗ GITHUB (версия в VERSION, суммы в MANIFEST.txt)
+# ============================================================
+UPDATE_REPO="${UPDATE_REPO:-S-ker/lan-toolkit}"
+UPDATE_BRANCH="${UPDATE_BRANCH:-main}"
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAW_BASE="https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH"
+TARBALL="https://codeload.github.com/$UPDATE_REPO/tar.gz/refs/heads/$UPDATE_BRANCH"
+
+http_get() {
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "${2:-}" ]; then curl -fsSL --max-time 120 "$1" -o "$2"; else curl -fsSL --max-time 10 "$1"; fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [ -n "${2:-}" ]; then wget -q -O "$2" "$1"; else wget -q -O - "$1"; fi
+  else
+    return 127
+  fi
+}
+
+local_version() { [ -f "$LOCAL_DIR/VERSION" ] && tr -d ' \t\r\n' < "$LOCAL_DIR/VERSION" || echo "0.0.0"; }
+remote_version() { http_get "$RAW_BASE/VERSION" 2>/dev/null | tr -d ' \t\r\n'; }
+
+ver_newer() {
+  [ "$1" = "$2" ] && return 1
+  local IFS='.'; local r=($1) l=($2) i a b
+  for i in 0 1 2; do
+    a="${r[$i]:-0}"; b="${l[$i]:-0}"
+    [ "$a" -gt "$b" ] 2>/dev/null && return 0
+    [ "$a" -lt "$b" ] 2>/dev/null && return 1
+  done
+  return 1
+}
+
+do_update_check() {
+  local quiet="${1:-0}" lv rv
+  lv="$(local_version)"; rv="$(remote_version)"
+  if [ -z "$rv" ]; then
+    [ "$quiet" != "1" ] && echo "  проверить не удалось (нет интернета?)"
+    return 2
+  fi
+  if ver_newer "$rv" "$lv"; then
+    [ "$quiet" != "1" ] && echo "  доступна новая версия: $rv (у тебя $lv)"
+    return 0
+  fi
+  [ "$quiet" != "1" ] && echo "  версия $lv — самая свежая"
+  return 1
+}
+
+do_update() {
+  local force="${1:-0}" lv rv
+  lv="$(local_version)"
+  hdr "Обновление"
+  echo "  Сейчас установлено: $lv"
+  rv="$(remote_version)"
+  [ -n "$rv" ] || { err "не смог узнать версию (интернет?)"; return 1; }
+  echo "  На GitHub          : $rv"
+  if [ "$force" != "1" ] && ! ver_newer "$rv" "$lv"; then ok "обновление не нужно"; return 0; fi
+  local tmp; tmp="$(mktemp -d)"
+  echo "  Скачиваю архив..."
+  http_get "$TARBALL" "$tmp/lt.tar.gz" || { err "скачать не удалось"; rm -rf "$tmp"; return 1; }
+  tar -xzf "$tmp/lt.tar.gz" -C "$tmp" || { err "архив не распаковался"; rm -rf "$tmp"; return 1; }
+  local root; root="$(find "$tmp" -maxdepth 1 -type d ! -path "$tmp" | head -1)"
+  [ -n "$root" ] || { err "пустой архив"; rm -rf "$tmp"; return 1; }
+  echo "  Проверяю содержимое..."
+  http_get "$RAW_BASE/MANIFEST.txt" "$root/MANIFEST.txt" || { err "нет MANIFEST.txt — отменяю"; rm -rf "$tmp"; return 1; }
+  if ! (cd "$root" && sha256sum -c MANIFEST.txt --quiet >/dev/null 2>&1); then
+    err "суммы не сошлись — ничего не меняю"; rm -rf "$tmp"; return 1
+  fi
+  ok "суммы сошлись"
+  local f
+  for f in lan-android.sh lan-linux.sh start-linux.sh; do
+    [ -f "$root/$f" ] && { bash -n "$root/$f" || { err "новый $f с ошибкой синтаксиса — отменяю"; rm -rf "$tmp"; return 1; }; }
+  done
+  local bk="$PEER_HOME/backup/$lv-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$bk"; cp -a "$LOCAL_DIR"/. "$bk"/ 2>/dev/null; rm -rf "$bk/.git"
+  echo "  Бэкап: $bk"
+  local n=0
+  while IFS= read -r f; do
+    case "$(basename "$f")" in .git*) continue ;; esac
+    cp -f "$f" "$LOCAL_DIR/$(basename "$f")" && n=$((n+1))
+  done < <(find "$root" -maxdepth 1 -type f)
+  chmod +x "$LOCAL_DIR"/*.sh 2>/dev/null
+  rm -rf "$tmp"
+  peer_audit "update $lv -> $rv ($n файлов)"
+  ok "обновлено до $rv (файлов: $n)"
+  echo "  Откатить: bash $0 rollback"
+}
+
+do_rollback() {
+  local base="$PEER_HOME/backup" last
+  [ -d "$base" ] || { err "бэкапов нет"; return 1; }
+  last="$(ls -1 "$base" | sort | tail -1)"
+  [ -n "$last" ] || { err "бэкапов нет"; return 1; }
+  hdr "Откат"
+  local n=0 f
+  for f in "$base/$last"/*; do
+    [ -f "$f" ] || continue
+    cp -f "$f" "$LOCAL_DIR/$(basename "$f")" && n=$((n+1))
+  done
+  chmod +x "$LOCAL_DIR"/*.sh 2>/dev/null
+  peer_audit "rollback из $last ($n файлов)"
+  ok "восстановлено файлов: $n (версия $(local_version))"
+}
+
 case "${1:-menu}" in
   menu)   do_menu ;;
   setup)  do_setup ;;
@@ -573,6 +692,9 @@ case "${1:-menu}" in
   peer-test)      peer_test "${@:2}" ;;
   peer-sync)      peer_sync "${@:2}" ;;
   peer-log)       peer_log ;;
+  update)         do_update ;;
+  update-check)   do_update_check "${2:-0}" ;;
+  rollback)       do_rollback ;;
   status) do_status ;;
   *) echo "usage: $0 {setup|ssh|http|get|mount|mc [join|server]|scan [prefix]|scan-ping <IP> [port]|world [list|push|pull|sync] <path> <user@IP:/dir>|sync <local> <user@IP:/dir> [sec]|peer-<keygen|add|list|arm|disarm|test|sync|log|serve>|status}"; exit 1 ;;
 esac

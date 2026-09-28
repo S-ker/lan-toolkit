@@ -11,12 +11,21 @@ ask_root() {   # $1 = команда
   sudo bash "$S" "$@"
 }
 
+# тихая проверка обновлений — один раз за запуск, а не на каждой перерисовке меню
+UPDATE_OFFER=""
+if [ "${NOUPDATECHECK:-0}" != "1" ] && [ ! -f "$HOME/.lan-toolkit/noupdate" ]; then
+  if bash "$S" update-check 2>/dev/null | grep -q "доступна новая"; then UPDATE_OFFER=1; fi
+fi
+
 while true; do
   clear 2>/dev/null
   echo ""
   echo -e "  ${C_C}==============================================================${C_0}"
-  echo -e "  ${C_C}      ЛОКАЛЬНАЯ СЕТЬ + MINECRAFT   (Linux)                  ${C_0}"
+  echo -e "  ${C_C}      ЛОКАЛЬНАЯ СЕТЬ + MINECRAFT   (Linux)   v$(tr -d ' \n' < "$DIR/VERSION" 2>/dev/null)${C_0}"
   echo -e "  ${C_C}==============================================================${C_0}"
+  if [ -n "$UPDATE_OFFER" ]; then
+    echo -e "  ${C_G}>>> ДОСТУПНО ОБНОВЛЕНИЕ — пункт 17 <<<${C_0}"
+  fi
   echo ""
   echo "   1  Подготовить сеть (общая папка + видимость в сети)"
   echo "   2  Показать мои адреса и состояние"
@@ -34,6 +43,7 @@ while true; do
   echo -e "  14  ${C_Y}Разрешить приём с другой машины на N минут (взвести)${C_0}"
   echo -e "  15  ${C_Y}Синхронизация с партнёром по SSH (обе стороны сами)${C_0}"
   echo "  16  Журнал удалённых действий"
+  echo -e "  17  ${C_C}Проверить и установить обновление${C_0}"
   echo "   0  Выход"
   echo ""
   read -rp "  Введи цифру и нажми Enter: " c
@@ -119,6 +129,15 @@ while true; do
        fi
        echo; read -rp "  Enter -> назад в меню" ;;
     16) bash "$S" peer-log; echo; read -rp "  Enter -> назад в меню" ;;
+    17)
+       bash "$S" update-check
+       echo
+       read -rp "  Установить обновление сейчас? [y/N]: " yn
+       if [ "$yn" = "y" ]; then
+         ask_root update
+         UPDATE_OFFER=""
+       fi
+       echo; read -rp "  Enter -> назад в меню" ;;
     0) exit 0 ;;
     *) echo "  Не понял. Введи цифру из списка."; sleep 2 ;;
   esac

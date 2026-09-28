@@ -792,6 +792,143 @@ peer_log() {
   else echo "журнал пуст"; fi
 }
 
+# ============================================================
+#  АВТООБНОВЛЕНИЕ ИЗ GITHUB
+#  Версия — в файле VERSION, суммы — в MANIFEST.txt.
+#  Порядок: версия -> архив -> проверка сумм и синтаксиса -> бэкап -> замена.
+# ============================================================
+UPDATE_REPO="${UPDATE_REPO:-S-ker/lan-toolkit}"
+UPDATE_BRANCH="${UPDATE_BRANCH:-main}"
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAW_BASE="https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH"
+TARBALL="https://codeload.github.com/$UPDATE_REPO/tar.gz/refs/heads/$UPDATE_BRANCH"
+
+http_get() { # $1 = url, $2 = выходной файл (пусто = в stdout)
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "${2:-}" ]; then curl -fsSL --max-time 120 "$1" -o "$2"; else curl -fsSL --max-time 10 "$1"; fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [ -n "${2:-}" ]; then wget -q -O "$2" "$1"; else wget -q -O - "$1"; fi
+  else
+    return 127
+  fi
+}
+
+local_version() { [ -f "$LOCAL_DIR/VERSION" ] && tr -d ' \t\r\n' < "$LOCAL_DIR/VERSION" || echo "0.0.0"; }
+remote_version() { http_get "$RAW_BASE/VERSION" 2>/dev/null | tr -d ' \t\r\n'; }
+
+ver_newer() { # $1 новее $2 ?
+  [ "$1" = "$2" ] && return 1
+  local IFS='.'
+  local r=($1) l=($2) i a b
+  for i in 0 1 2; do
+    a="${r[$i]:-0}"; b="${l[$i]:-0}"
+    [ "$a" -gt "$b" ] 2>/dev/null && return 0
+    [ "$a" -lt "$b" ] 2>/dev/null && return 1
+  done
+  return 1
+}
+
+do_update_check() {
+  local quiet="${1:-0}" lv rv
+  lv="$(local_version)"
+  rv="$(remote_version)"
+  if [ -z "$rv" ]; then
+    [ "$quiet" != "1" ] && echo "  проверить не удалось (нет интернета?) — работаю как есть"
+    return 2
+  fi
+  if ver_newer "$rv" "$lv"; then
+    [ "$quiet" != "1" ] && echo "  доступна новая версия: $rv (у тебя $lv)"
+    return 0
+  fi
+  [ "$quiet" != "1" ] && echo "  версия $lv — самая свежая"
+  return 1
+}
+
+do_update() {
+  local force="${1:-0}" lv rv
+  lv="$(local_version)"
+  hdr "Обновление"
+  echo "  Сейчас установлено: $lv"
+  rv="$(remote_version)"
+  if [ -z "$rv" ]; then err "не смог узнать версию на GitHub (интернет?)"; return 1; fi
+  echo "  На GitHub          : $rv"
+  if [ "$force" != "1" ] && ! ver_newer "$rv" "$lv"; then ok "обновление не нужно"; return 0; fi
+
+  local tmp; tmp="$(mktemp -d)"
+  echo "  Скачиваю архив..."
+  if ! http_get "$TARBALL" "$tmp/lt.tar.gz"; then
+    err "скачать не удалось (нет curl/wget или нет сети)"; rm -rf "$tmp"; return 1
+  fi
+  tar -xzf "$tmp/lt.tar.gz" -C "$tmp" || { err "архив не распаковался"; rm -rf "$tmp"; return 1; }
+  local root; root="$(find "$tmp" -maxdepth 1 -type d ! -path "$tmp" | head -1)"
+  [ -n "$root" ] || { err "пустой архив"; rm -rf "$tmp"; return 1; }
+
+  echo "  Проверяю содержимое..."
+  if ! http_get "$RAW_BASE/MANIFEST.txt" "$root/MANIFEST.txt"; then
+    err "нет MANIFEST.txt — проверить целостность не могу, отменяю"; rm -rf "$tmp"; return 1
+  fi
+  if ! (cd "$root" && sha256sum -c MANIFEST.txt --quiet >/dev/null 2>&1); then
+    err "суммы не сошлись — ничего не меняю"
+    (cd "$root" && sha256sum -c MANIFEST.txt 2>&1 | grep -v ': OK$' | head -5)
+    rm -rf "$tmp"; return 1
+  fi
+  ok "суммы сошлись"
+
+  local f
+  for f in lan-linux.sh lan-android.sh start-linux.sh; do
+    if [ -f "$root/$f" ]; then
+      bash -n "$root/$f" || { err "новый $f с ошибкой синтаксиса — отменяю"; rm -rf "$tmp"; return 1; }
+    fi
+  done
+
+  local bk="$PEER_HOME/backup/$lv-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$bk"
+  cp -a "$LOCAL_DIR"/. "$bk"/ 2>/dev/null
+  rm -rf "$bk/.git"
+  echo "  Бэкап: $bk"
+
+  local n=0
+  while IFS= read -r f; do
+    case "$(basename "$f")" in .git*) continue ;; esac
+    cp -f "$f" "$LOCAL_DIR/$(basename "$f")" && n=$((n+1))
+  done < <(find "$root" -maxdepth 1 -type f)
+  chmod +x "$LOCAL_DIR"/*.sh 2>/dev/null
+  rm -rf "$tmp"
+  peer_audit "update $lv -> $rv ($n файлов)"
+  ok "обновлено до $rv (файлов: $n)"
+  echo "  Откатить: bash $0 rollback"
+  echo "  Вторую машину тоже обнови — иначе режим «партнёр» откажет по хешу."
+}
+
+do_rollback() {
+  local base="$PEER_HOME/backup" last
+  [ -d "$base" ] || { err "бэкапов нет"; return 1; }
+  last="$(ls -1 "$base" | sort | tail -1)"
+  [ -n "$last" ] || { err "бэкапов нет"; return 1; }
+  hdr "Откат"
+  echo "  Из: $base/$last"
+  local n=0 f
+  for f in "$base/$last"/*; do
+    [ -f "$f" ] || continue
+    cp -f "$f" "$LOCAL_DIR/$(basename "$f")" && n=$((n+1))
+  done
+  chmod +x "$LOCAL_DIR"/*.sh 2>/dev/null
+  peer_audit "rollback из $last ($n файлов)"
+  ok "восстановлено файлов: $n (версия $(local_version))"
+}
+
+make_manifest() {
+  local names=(VERSION lan-win.ps1 lan-linux.sh lan-android.sh mcping.py start-linux.sh START-Windows.bat
+               "НАЧАТЬ-Windows.bat" "НАЧАТЬ-Linux.desktop" README.md .gitattributes .gitignore)
+  local n
+  : > "$LOCAL_DIR/MANIFEST.txt"
+  for n in "${names[@]}"; do
+    [ -f "$LOCAL_DIR/$n" ] || continue
+    printf '%s  %s\n' "$(sha256sum -- "$LOCAL_DIR/$n" | cut -d' ' -f1)" "$n" >> "$LOCAL_DIR/MANIFEST.txt"
+  done
+  ok "MANIFEST.txt обновлён"
+}
+
 case "${1:-setup}" in
   setup)  do_setup "${@:2}" ;;
   share)  do_share "${@:2}" ;;
@@ -813,6 +950,10 @@ case "${1:-setup}" in
   peer-test)    peer_test "${@:2}" ;;
   peer-sync)    peer_sync "${@:2}" ;;
   peer-log)     peer_log ;;
+  update)       do_update ;;
+  update-check) do_update_check "${2:-0}" ;;
+  update-manifest) make_manifest ;;
+  rollback)     do_rollback ;;
   status) do_status ;;
   remove) do_remove "${@:2}" ;;
   *) echo "usage: $0 {setup|share|http|mount|ssh|mc [java|bedrock|firewall|join]|detect|world [list|push|pull|sync|backup]|sync <local> <remote> [sec]|peer-<keygen|add|list|forget|arm|disarm|bootstrap|test|sync|log|serve>|status|remove}"; exit 1 ;;
