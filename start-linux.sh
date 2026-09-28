@@ -30,6 +30,10 @@ while true; do
   echo "  10  Подключиться к папке на Windows по IP"
   echo "  11  Открыть SSH (чтобы заходить с телефона/ПК)"
   echo "  12  Убрать все настройки этой программы"
+  echo -e "  13  ${C_Y}ПАРТНЁР по SSH: ключ, залить скрипты, проверить связь${C_0}"
+  echo -e "  14  ${C_Y}Разрешить приём с другой машины на N минут (взвести)${C_0}"
+  echo -e "  15  ${C_Y}Синхронизация с партнёром по SSH (обе стороны сами)${C_0}"
+  echo "  16  Журнал удалённых действий"
   echo "   0  Выход"
   echo ""
   read -rp "  Введи цифру и нажми Enter: " c
@@ -67,6 +71,54 @@ while true; do
        echo; read -rp "  Enter -> назад в меню" ;;
     11) ask_root ssh; echo; read -rp "  Enter -> назад в меню" ;;
     12) ask_root remove; echo; read -rp "  Enter -> назад в меню" ;;
+    13)
+       echo "   1 — создать ключ тулкита (один раз)"
+       echo "   2 — добавить партнёра по IP"
+       echo "   3 — залить скрипты на партнёра"
+       echo "   4 — проверить связь"
+       echo "   5 — показать список партнёров"
+       read -rp "  Цифра: " s
+       case "$s" in
+         1) bash "$S" peer-keygen ;;
+         2) read -rp "  Имя партнёра: " n
+            read -rp "  IP партнёра: " h
+            read -rp "  Логин на партнёре (Enter = как тут): " u
+            read -rp "  Порт SSH (Enter = 22): " pt
+            read -rp "  Система: [1] Windows [2] Linux [3] Android (Enter=2): " pl
+            case "$pl" in 1) pl=win ;; 3) pl=android ;; *) pl=linux ;; esac
+            bash "$S" peer-add "$n" "$h" "${u:-$(whoami)}" "${pt:-22}" "$pl" ;;
+         3) read -rp "  Имя партнёра: " n; bash "$S" peer-bootstrap "$n" ;;
+         4) read -rp "  Имя партнёра: " n; bash "$S" peer-test "$n" ;;
+         5) bash "$S" peer-list ;;
+       esac
+       echo; read -rp "  Enter -> назад в меню" ;;
+    14)
+       echo "  Придумай код (6+ символов) и скажи его тому, кто будет подключаться."
+       read -rp "  Код: " t
+       if [ -n "$t" ]; then
+         read -rp "  На сколько минут (Enter = 30, максимум 240): " m
+         read -rp "  Только один проход? [y/N]: " one
+         read -rp "  Разрешить только с машины (Enter = любую): " fp
+         args=(-t "$t" -m "${m:-30}")
+         [ "$one" = "y" ] && args+=(--once)
+         [ -n "$fp" ] && args+=(--fp "$fp")
+         bash "$S" peer-arm "${args[@]}"
+       fi
+       echo; read -rp "  Enter -> назад в меню" ;;
+    15)
+       bash "$S" peer-list
+       echo
+       read -rp "  Имя партнёра: " n
+       if [ -n "$n" ]; then
+         read -rp "  Моя папка (Enter = общая папка программы/обмен): " ld
+         read -rp "  Папка на партнёре (Enter = то же имя у него): " rd
+         read -rp "  Обновлять каждые N секунд? (Enter = один раз): " sec
+         read -rp "  Код, который сказал человек на той машине: " tok
+         if [ -z "$tok" ]; then echo "  Без кода та машина откажет, если на ней так настроено."; fi
+         TOKEN="$tok" sudo -E bash "$S" peer-sync "$n" "${ld:-}" "${rd:-}" "${sec:-0}"
+       fi
+       echo; read -rp "  Enter -> назад в меню" ;;
+    16) bash "$S" peer-log; echo; read -rp "  Enter -> назад в меню" ;;
     0) exit 0 ;;
     *) echo "  Не понял. Введи цифру из списка."; sleep 2 ;;
   esac

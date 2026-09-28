@@ -18,7 +18,9 @@
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet('setup','status','http','hotspot','mount','unmount','remove','minecraft','mc','menu','detect','world','sync')]
+  [ValidateSet('setup','status','http','hotspot','mount','unmount','remove','minecraft','mc','menu','detect','world','sync',
+               'peer-keygen','peer-add','peer-list','peer-forget','peer-arm','peer-disarm','peer-test','peer-bootstrap',
+               'peer-run','peer-sync','peer-serve','peer-log')]
   [string]$Action = 'menu',
 
   [string]$ShareName = 'LAN',
@@ -39,6 +41,22 @@ param(
   [switch]$Mirror,
   [switch]$Force,
   [switch]$NoBackup,
+  # --- peer (удалённая синхронизация) ---
+  [string]$Peer     = '',
+  [string]$PeerHost = '',
+  [string]$PeerUser = '',
+  [int]   $PeerPort = 22,
+  [ValidateSet('win','linux','android')]
+  [string]$PeerPlatform = 'linux',
+  [string]$PeerToolkit = 'lan-toolkit',
+  [string]$Token    = '',
+  [int]   $Minutes  = 30,
+  [string]$Cmd      = '',
+  [string]$RemoteDir = '',
+  [string]$AllowFp  = '',
+  [string]$RequestFile = '',
+  [switch]$Once,
+  [switch]$AllowVersionDrift,
   [switch]$On
 )
 
@@ -50,7 +68,7 @@ function Test-Admin {
   (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
-if (-not (Test-Admin) -and $Action -notin 'menu','status','mc','detect','world','sync') {
+if (-not (Test-Admin) -and $Action -in 'setup','hotspot','mount','unmount','remove','http','minecraft') {
   Write-Host "" ; Write-Host "  Сейчас Windows спросит разрешение — нажми ДА." -ForegroundColor Yellow
   $exe = (Get-Process -Id $PID).Path
   $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action $Action " +
@@ -687,6 +705,15 @@ function Do-World {
   Write-Host "  Готово. Общая папка мира: $dest" -ForegroundColor Green
 }
 
+function Invoke-SyncPass {
+  param([string]$LocalDir, [string]$RemoteDir, [switch]$Mirror)
+  $rc = @('/E','/XO','/R:1','/W:1','/NFL','/NDL','/NJH','/NJS','/NP')
+  if ($Mirror) { $rc += '/MIR' }
+  $null = robocopy $LocalDir $RemoteDir @rc; $to = $LASTEXITCODE
+  $null = robocopy $RemoteDir $LocalDir @rc; $back = $LASTEXITCODE
+  return [pscustomobject]@{ ToRemote = $to; ToLocal = $back }
+}
+
 function Do-Sync {
   Write-Host "`n=== Двусторонний обмен папками ===" -ForegroundColor Cyan
   $localDir = if ($Local) { $Local } else { $Path }
@@ -698,14 +725,10 @@ function Do-Sync {
   if ($Mirror) { Write-Host "  Режим    : ЗЕРКАЛО (удаляет лишнее на обеих сторонах!)" -ForegroundColor Yellow }
   else { Write-Host "  Режим    : безопасный (новее побеждает, ничего не удаляется)" -ForegroundColor Green }
 
-  $rc = @('/E','/XO','/R:1','/W:1','/NFL','/NDL','/NJH','/NJS','/NP')
-  if ($Mirror) { $rc += '/MIR' }
-
   $pass = {
-    Write-Host ("  [{0}] туда..." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Cyan
-    $null = robocopy $localDir $remoteDir @rc; Write-Host "     -> $(Get-RobocopyCode $LASTEXITCODE)"
-    Write-Host ("  [{0}] обратно..." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Cyan
-    $null = robocopy $remoteDir $localDir @rc; Write-Host "     -> $(Get-RobocopyCode $LASTEXITCODE)"
+    Write-Host ("  [{0}] туда и обратно..." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Cyan
+    $res = Invoke-SyncPass -LocalDir $localDir -RemoteDir $remoteDir -Mirror:$Mirror
+    Write-Host "     -> туда: $(Get-RobocopyCode $res.ToRemote) | обратно: $(Get-RobocopyCode $res.ToLocal)"
   }
   & $pass
   if ($Watch -and [int]$Watch -gt 0) {
@@ -714,6 +737,415 @@ function Do-Sync {
   } else {
     Write-Host "  Один проход завершён. Для постоянного обмена: -Watch 30" -ForegroundColor Gray
   }
+}
+
+# ================= PEER: удалённая синхронизация через SSH =================
+# Идея: на обоих устройствах лежит ОДИН И ТОТ ЖЕ скрипт. Инициатор заходит по SSH
+# и просит вторую сторону сделать её половину работы. Защиты (по порядку проверки):
+#   1) SSH-доступ уже разрешён администратором той машины (ключ в authorized_keys);
+#   2) принимающая сторона ВЗВЕДЕНА вручную: peer-arm -Token XXX -Minutes 30
+#      (взвести удалённо нельзя — команды arm/disarm в белом списке нет);
+#   3) токен + срок жизни + опционально «одноразово»;
+#   4) белый список команд: ping, hash, status, detect, world, sync, mcjoin;
+#   5) сверка хеша тулкита — на обеих машинах должен быть одинаковый скрипт;
+#   6) всё пишется в audit.log, включая отказы.
+
+function Get-PeerHome {
+  $h = Join-Path $env:USERPROFILE '.lan-toolkit'
+  if (-not (Test-Path $h)) { New-Item -ItemType Directory -Force -Path $h | Out-Null }
+  return $h
+}
+function Get-PeerFile([string]$n) { return (Join-Path (Get-PeerHome) $n) }
+function Get-PeerKeyPath { return (Join-Path (Get-PeerHome) 'keys\id_ed25519') }
+function Get-PeerKnownHosts { return (Get-PeerFile 'known_hosts_peers') }
+
+function Get-PeerList {
+  $f = Get-PeerFile 'peers.json'
+  if (-not (Test-Path $f)) { return @() }
+  try { return @(Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return @() }
+}
+function Save-PeerList($list) {
+  $arr = @($list)
+  if ($arr.Count -eq 0) { '[]' | Set-Content -Path (Get-PeerFile 'peers.json') -Encoding UTF8; return }
+  ($arr | ConvertTo-Json -Depth 6) | Set-Content -Path (Get-PeerFile 'peers.json') -Encoding UTF8
+}
+function Get-Peer([string]$name) {
+  if (-not $name) { return $null }
+  return (Get-PeerList | Where-Object { $_.Name -eq $name } | Select-Object -First 1)
+}
+function Write-PeerAudit([string]$line) {
+  Add-Content -Path (Get-PeerFile 'audit.log') -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + "  " + $line) -Encoding UTF8
+}
+function Get-StrHash([string]$s) {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  return (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s)) | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+function Get-ToolkitHash {
+  # Фиксированный список файлов — так хеш совпадает и в PowerShell, и в bash.
+  # Отсутствующий файл считается пустым ('-'), поэтому Linux без lan-win.ps1
+  # даст тот же хеш, что и Windows.
+  $names = @('lan-win.ps1','lan-linux.sh','lan-android.sh','mcping.py')
+  $sb = New-Object Text.StringBuilder
+  foreach ($n in $names) {
+    $fp = Join-Path $PSScriptRoot $n
+    $h = if (Test-Path $fp) { (Get-FileHash -Algorithm SHA256 -Path $fp).Hash.ToLower() } else { '-' }
+    [void]$sb.Append($n).Append(':').Append($h).Append("`n")
+  }
+  return (Get-StrHash $sb.ToString())
+}
+function Get-ArmState {
+  $f = Get-PeerFile 'armed.json'
+  if (-not (Test-Path $f)) { return $null }
+  try { return (Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+
+function Do-PeerKeygen {
+  $key = Get-PeerKeyPath
+  if (Test-Path $key) { Write-Host "Ключ уже есть: $key" -ForegroundColor Green }
+  else {
+    $dir = Split-Path $key -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    & ssh-keygen -t ed25519 -N '""' -C "lan-toolkit@$env:COMPUTERNAME" -f $key 2>&1 | Out-Null
+    Write-Host "Создан ключ тулкита: $key" -ForegroundColor Green
+  }
+  Write-Host "`nПубличный ключ — добавить на ВТОРОЙ машине:" -ForegroundColor Yellow
+  Get-Content "$key.pub"
+  Write-Host "`n  Windows-цель : строка в C:\Users\<user>\.ssh\authorized_keys" -ForegroundColor Gray
+  Write-Host "                 (если user в группе админов — в C:\ProgramData\ssh\administrators_authorized_keys," -ForegroundColor Gray
+  Write-Host "                  права только Administrators и SYSTEM, иначе sshd ключ проигнорирует)" -ForegroundColor Gray
+  Write-Host "  Linux/Android: ssh-copy-id -i `"$key.pub`" user@IP" -ForegroundColor Gray
+}
+
+function Do-PeerAdd {
+  if (-not $Peer) { Write-Host "Укажи -Peer имя -PeerHost IP [-PeerUser user]"; return }
+  if (-not $PeerHost) { Write-Host "Укажи -PeerHost IP"; return }
+  $plat = if ($PeerPlatform) { $PeerPlatform } else { 'linux' }
+  $usr  = if ($PeerUser) { $PeerUser } else { $env:USERNAME }
+  $prt  = if ($PeerPort) { $PeerPort } else { 22 }
+  $tk   = if ($PeerToolkit) { $PeerToolkit } else { 'lan-toolkit' }
+
+  Write-Host "Пинную host key (ssh-keyscan)..." -ForegroundColor Cyan
+  $kh = Get-PeerKnownHosts
+  $scan = & ssh-keyscan -p $prt $PeerHost 2>$null
+  if (-not $scan) { Write-Host "[!] host key не прочитан — машина недоступна?" -ForegroundColor Yellow }
+  else { $scan | Set-Content -Path $kh -Encoding ASCII; Write-Host "  [+] host key сохранён: $kh" -ForegroundColor Green }
+  $fp = ''
+  try { $line = ($scan | Select-String 'ssh-ed25519' | Select-Object -First 1).Line; $fp = ($line -split ' ')[1] } catch {}
+
+  $list = @(Get-PeerList | Where-Object { $_.Name -ne $Peer })
+  $list += [pscustomobject]@{
+    Name = $Peer; Host = $PeerHost; User = $usr; Port = [int]$prt
+    Platform = $plat; Toolkit = $tk; Fingerprint = $fp; Added = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+  }
+  Save-PeerList $list
+  Write-Host "  [+] peer '$Peer' -> $usr@$PeerHost`:$prt ($plat)" -ForegroundColor Green
+  Write-Host "`nДальше:" -ForegroundColor Cyan
+  Write-Host "  1) .\lan-win.ps1 peer-bootstrap -Peer $Peer     # залить тулкит на ту машину"
+  Write-Host "  2) .\lan-win.ps1 peer-keygen                    # и добавить ключ на ту машину"
+  Write-Host "  3) НА ТОЙ МАШИНЕ человек взводит: peer-arm -Token <код> -Minutes 30"
+  Write-Host "  4) .\lan-win.ps1 peer-test -Peer $Peer"
+}
+
+function Do-PeerListCmd {
+  $list = Get-PeerList
+  if (-not $list) { Write-Host "Партнёров нет. Добавь: -Action peer-add -Peer имя -PeerHost IP" -ForegroundColor Yellow }
+  else {
+    Write-Host "`nИзвестные партнёры:" -ForegroundColor Cyan
+    $list | Format-Table Name, Host, User, Port, Platform -AutoSize
+  }
+  $arm = Get-ArmState
+  Write-Host "Состояние ЭТОЙ машины (приём удалённых команд):" -ForegroundColor Cyan
+  if (-not $arm) { Write-Host "  не взведена — удалённые команды отклоняются" -ForegroundColor Gray }
+  else {
+    $left = [math]::Round((([datetime]$arm.Expires) - (Get-Date)).TotalMinutes, 1)
+    if ($left -le 0) { Write-Host "  взведена, но срок истёк ($($arm.Expires))" -ForegroundColor Yellow }
+    else {
+      $fpTxt = if ($arm.AllowFp) { $arm.AllowFp } else { 'любой' }
+      Write-Host "  ВЗВЕДЕНА ещё $left мин (одноразово: $($arm.Once), инициатор: $fpTxt)" -ForegroundColor Green
+    }
+  }
+}
+
+function Do-PeerForget {
+  if (-not $Peer) { Write-Host "Укажи -Peer имя"; return }
+  Save-PeerList @(Get-PeerList | Where-Object { $_.Name -ne $Peer })
+  Write-PeerAudit "peer-forget $Peer"
+  Write-Host "[-] партнёр '$Peer' удалён"
+}
+
+function Do-PeerArm {
+  if (-not $Token) { Write-Host "[!] Нужен -Token <код>." -ForegroundColor Yellow; return }
+  if ($Token.Length -lt 6) { Write-Host "[!] Токен короче 6 символов." -ForegroundColor Red; return }
+  $min = if ($Minutes -gt 0) { $Minutes } else { 30 }
+  if ($min -gt 240) { Write-Host "[!] Максимум 240 минут." -ForegroundColor Red; return }
+  $state = [pscustomobject]@{
+    TokenHash   = (Get-StrHash $Token)
+    Expires     = (Get-Date).AddMinutes($min).ToString('yyyy-MM-dd HH:mm:ss')
+    Once        = [bool]$Once
+    Uses        = 0
+    AllowFp     = $(if ($AllowFp) { $AllowFp } else { '' })
+    ToolkitHash = (Get-ToolkitHash)
+    ArmedBy     = "$env:USERNAME@$env:COMPUTERNAME"
+  }
+  ($state | ConvertTo-Json) | Set-Content -Path (Get-PeerFile 'armed.json') -Encoding UTF8
+  Write-PeerAudit "ARM на $min мин, once=$($Once)"
+  Write-Host "[+] Машина взведена на $min мин — принимаю удалённую синхронизацию." -ForegroundColor Green
+  Write-Host "    Отключить: .\lan-win.ps1 peer-disarm" -ForegroundColor Gray
+  Write-Host "    Токен хранится только как SHA-256." -ForegroundColor Gray
+}
+
+function Do-PeerDisarm {
+  $f = Get-PeerFile 'armed.json'
+  if (Test-Path $f) { Remove-Item $f -Force }
+  Write-PeerAudit "DISARM"
+  Write-Host "[-] Машина больше не принимает удалённые команды." -ForegroundColor Green
+}
+
+function Get-RemoteRunner($p) {
+  $tk = ($p.Toolkit -replace '/', '\')
+  if ($p.Platform -eq 'win') {
+    return 'powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\' + $tk + '\lan-win.ps1" -Action peer-serve'
+  }
+  if ($p.Platform -eq 'android') { return 'bash "$HOME/' + $p.Toolkit + '/lan-android.sh" peer-serve' }
+  return 'bash "$HOME/' + $p.Toolkit + '/lan-linux.sh" peer-serve'
+}
+
+function Invoke-PeerServeRemote {
+  param($PeerObj, [string]$RequestText)
+  $key = Get-PeerKeyPath
+  if (-not (Test-Path $key)) { throw "Нет SSH-ключа тулкита. Запусти: -Action peer-keygen" }
+  $argList = @('-i', $key, '-p', "$($PeerObj.Port)",
+               '-o', "UserKnownHostsFile=$(Get-PeerKnownHosts)",
+               '-o', 'StrictHostKeyChecking=yes',
+               '-o', 'BatchMode=yes',
+               '-o', 'ConnectTimeout=8',
+               "$($PeerObj.User)@$($PeerObj.Host)",
+               (Get-RemoteRunner $PeerObj))
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = (Get-Command ssh).Source
+  $quoted = foreach ($a in $argList) { if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a } }
+  $psi.Arguments = ($quoted -join ' ')
+  $psi.RedirectStandardInput = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
+  $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+  $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+  $proc = [Diagnostics.Process]::Start($psi)
+  $proc.StandardInput.Write($RequestText)
+  $proc.StandardInput.Close()
+  $outTask = $proc.StandardOutput.ReadToEndAsync()
+  $errTask = $proc.StandardError.ReadToEndAsync()
+  $proc.WaitForExit(600000) | Out-Null
+  return [pscustomobject]@{ Exit = $proc.ExitCode; Out = $outTask.Result; Err = $errTask.Result }
+}
+
+function New-PeerRequest([string]$CmdName, [hashtable]$Args, [string]$TokenText) {
+  $sb = New-Object Text.StringBuilder
+  [void]$sb.AppendLine('v=1')
+  [void]$sb.AppendLine("cmd=$CmdName")
+  [void]$sb.AppendLine("token=$TokenText")
+  [void]$sb.AppendLine("from=$env:USERNAME@$env:COMPUTERNAME")
+  [void]$sb.AppendLine("hash=$(Get-ToolkitHash)")
+  foreach ($k in $Args.Keys) { [void]$sb.AppendLine("arg.$k=$($Args[$k])") }
+  [void]$sb.AppendLine('')
+  return $sb.ToString()
+}
+
+function Read-PeerResult([string]$Out) {
+  $res = @{}
+  foreach ($line in ($Out -split "`r?`n")) {
+    if ($line -match '^([A-Za-z_]+)=(.*)$') { $res[$Matches[1]] = $Matches[2] }
+  }
+  return $res
+}
+
+function Do-PeerBootstrap {
+  if (-not $Peer) { Write-Host "Укажи -Peer имя"; return }
+  $p = Get-Peer $Peer
+  if (-not $p) { Write-Host "Партнёр '$Peer' не найден"; return }
+  Write-Host "Копирую тулкит на $($p.User)@$($p.Host) ($($p.Platform))..." -ForegroundColor Cyan
+  $key = Get-PeerKeyPath
+  $kh = Get-PeerKnownHosts
+  $base = @('-i', $key, '-P', "$($p.Port)", '-o', "UserKnownHostsFile=$kh", '-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes')
+  $remoteDir = ($p.Toolkit -replace '\\', '/')
+  $target = "$($p.User)@$($p.Host)"
+  if ($p.Platform -eq 'win') {
+    & ssh @base $target ("mkdir `"$($p.Toolkit)`" 2>nul & echo ok") | Out-Null
+  } else {
+    & ssh @base $target ("mkdir -p `"`$HOME/$remoteDir`"") | Out-Null
+  }
+  if ($LASTEXITCODE -ne 0) { Write-Host "[!] SSH не пускает — ключ добавлен на той машине?" -ForegroundColor Red; return }
+  $files = Get-ChildItem $PSScriptRoot -File | Where-Object { $_.Name -notlike '.*' -and $_.Extension -ne '.pyc' }
+  $okCount = 0
+  foreach ($f in $files) {
+    & scp @base $f.FullName "$target`:$remoteDir/$($f.Name)" 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { $okCount++ }
+  }
+  if ($p.Platform -ne 'win') {
+    & ssh @base $target ("chmod +x `"`$HOME/$remoteDir`"/*.sh 2>/dev/null; echo ok") | Out-Null
+  }
+  Write-Host "  [+] отправлено файлов: $okCount из $($files.Count)" -ForegroundColor Green
+  Write-PeerAudit "bootstrap $Peer ($okCount файлов)"
+  Write-Host "Теперь НА ТОЙ машине человек выполняет: peer-arm -Token <код>" -ForegroundColor Yellow
+}
+
+function Do-PeerTest {
+  if (-not $Peer) { Write-Host "Укажи -Peer имя"; return }
+  $p = Get-Peer $Peer
+  if (-not $p) { Write-Host "Партнёр '$Peer' не найден"; return }
+  $r = Invoke-PeerServeRemote -PeerObj $p -RequestText (New-PeerRequest 'ping' @{} '')
+  if ($r.Exit -ne 0 -and -not $r.Out) {
+    Write-Host "[!] SSH не отвечает (exit $($r.Exit)): $($r.Err)" -ForegroundColor Red
+    Write-PeerAudit "test $Peer -> SSH FAIL $($r.Exit)"
+    return
+  }
+  $res = Read-PeerResult $r.Out
+  Write-Host "`nОтвет второй стороны:" -ForegroundColor Cyan
+  Write-Host "  RESULT: $($res['RESULT'])" -ForegroundColor $(if ($res['RESULT'] -eq 'ok') { 'Green' } else { 'Yellow' })
+  if ($res['RESULT'] -ne 'ok' -and $res['MSG']) {
+    Write-Host "  MSG   : $($res['MSG'])" -ForegroundColor Yellow
+    switch -Wildcard ($res['MSG']) {
+      '*не взведена*'   { Write-Host "  -> На той машине: bash lan-linux.sh peer-arm -Token <код> -Minutes 30" -ForegroundColor Gray }
+      '*токен*'         { Write-Host "  -> Токен не совпал. Возьми тот, что вводили на той машине." -ForegroundColor Gray }
+      '*разные*'        { Write-Host "  -> Обнови тулкит на обеих машинах (peer-bootstrap)." -ForegroundColor Gray }
+    }
+  }
+  if ($res['hash']) {
+    $mine = Get-ToolkitHash
+    if ($res['hash'] -eq $mine) { Write-Host "  Скрипты совпадают: $($mine.Substring(0,12))..." -ForegroundColor Green }
+    else { Write-Host "  [!] Версии скриптов разные.`n      моя: $mine`n      чужая: $($res['hash'])" -ForegroundColor Red }
+  }
+  Write-PeerAudit "test $Peer -> $($res['RESULT']) $($res['MSG'])"
+}
+
+function Do-PeerRun {
+  if (-not $Peer -or -not $Cmd) { Write-Host "Укажи -Peer имя -Cmd status|detect|world|mcjoin"; return }
+  $p = Get-Peer $Peer
+  if (-not $p) { Write-Host "Партнёр '$Peer' не найден"; return }
+  $a = @{}
+  if ($WorldMode) { $a['mode'] = $WorldMode }
+  if ($World) { $a['world'] = $World }
+  $r = Invoke-PeerServeRemote -PeerObj $p -RequestText (New-PeerRequest $Cmd $a $Token)
+  Write-Host "`n=== Вывод второй машины ($Peer) ===" -ForegroundColor Cyan
+  Write-Host $r.Out
+  if ($r.Err) { Write-Host $r.Err -ForegroundColor Yellow }
+  $res = Read-PeerResult $r.Out
+  Write-PeerAudit "run $Peer cmd=$Cmd -> $($res['RESULT'])"
+}
+
+function Do-PeerSync {
+  if (-not $Peer) { Write-Host "Укажи -Peer имя"; return }
+  $p = Get-Peer $Peer
+  if (-not $p) { Write-Host "Партнёр '$Peer' не найден"; return }
+  $localDir  = if ($Local) { $Local } else { Join-Path $Path 'обмен' }
+  $remoteDir = if ($RemoteDir) { $RemoteDir } else { Join-Path $Path 'обмен' }
+  $sec = if ($Watch -gt 0) { $Watch } else { 0 }
+  $shareName = Split-Path $Path -Leaf
+  $subName = Split-Path $localDir -Leaf
+  Write-Host "`n=== Двусторонняя синхронизация с '$Peer' ===" -ForegroundColor Cyan
+  Write-Host "  моя папка      : $localDir"
+  Write-Host "  папка на $Peer : $remoteDir"
+  Write-Host "  интервал       : $(if ($sec -gt 0) { "$sec сек" } else { 'один проход' })"
+
+  $pass = {
+    $myIp = (Get-LanIP | Select-Object -First 1)
+    $a = @{ local = $remoteDir; remote = "\\$myIp\$shareName\$subName"; watch = 0 }
+    if ($Mirror) { $a['mirror'] = 1 }
+    $r = Invoke-PeerServeRemote -PeerObj $p -RequestText (New-PeerRequest 'sync' $a $Token)
+    $res = Read-PeerResult $r.Out
+    if ($res['RESULT'] -eq 'ok') { Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] вторая сторона: ок ($($res['MSG']))" -ForegroundColor Green }
+    else { Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] вторая сторона: $($res['RESULT']) — $($res['MSG'])" -ForegroundColor Yellow }
+    $mine = Invoke-SyncPass -LocalDir $localDir -RemoteDir "\\$($p.Host)\$shareName\$subName" -Mirror:$Mirror
+    Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] моя сторона: туда=$($mine.ToRemote) обратно=$($mine.ToLocal)" -ForegroundColor Green
+    Write-PeerAudit "sync $Peer local=$localDir remote=$remoteDir"
+  }
+  & $pass
+  if ($sec -gt 0) {
+    Write-Host "  Слежение каждые $sec сек. Ctrl+C — стоп." -ForegroundColor Green
+    while ($true) { Start-Sleep -Seconds $sec; & $pass }
+  }
+}
+
+function Do-PeerLog {
+  $f = Get-PeerFile 'audit.log'
+  if (-not (Test-Path $f)) { Write-Host "Журнал пуст."; return }
+  Write-Host "`n=== Журнал ($f) ===" -ForegroundColor Cyan
+  Get-Content $f -Tail 40
+}
+
+# --- принимающая сторона: выполняется на второй машине ---
+function Do-PeerServe {
+  param([string]$RequestFile)
+  $raw = ''
+  if ($RequestFile -and (Test-Path $RequestFile)) { $raw = Get-Content $RequestFile -Raw -Encoding UTF8 }
+  else { try { $raw = [Console]::In.ReadToEnd() } catch {} }
+
+  $req = @{}
+  foreach ($line in ($raw -split "`r?`n")) {
+    if ($line -match '^([A-Za-z_.]+)=(.*)$') { $req[$Matches[1]] = $Matches[2] }
+  }
+  $cmd = $req['cmd']; $token = $req['token']; $from = $req['from']; $theirHash = $req['hash']
+
+  function Deny([string]$why) {
+    Write-PeerAudit "DENY cmd=$cmd from=${from}: $why"
+    Write-Output 'RESULT=denied'
+    Write-Output "MSG=$why"
+  }
+
+  $arm = Get-ArmState
+  if (-not $arm) { Deny 'машина не взведена: нужно выполнить peer-arm -Token <код>'; return }
+  if ((Get-Date) -gt [datetime]$arm.Expires) { Deny "срок взведения истёк ($($arm.Expires))"; return }
+  if (-not $token) { Deny 'не передан токен'; return }
+  if ((Get-StrHash $token) -ne $arm.TokenHash) { Deny 'неверный токен'; return }
+  if ($arm.AllowFp -and $arm.AllowFp -ne $from) { Deny "инициатор $from не разрешён"; return }
+
+  $allowed = @('ping','hash','status','detect','world','sync','mcjoin')
+  if ($allowed -notcontains $cmd) { Deny "команда '$cmd' не в белом списке"; return }
+
+  $myHash = Get-ToolkitHash
+  if ($theirHash -and $theirHash -ne $myHash -and -not $AllowVersionDrift) {
+    Write-PeerAudit "DENY cmd=$cmd from=${from}: hash mismatch"
+    Write-Output 'RESULT=denied'
+    Write-Output "MSG=версии скриптов разные: у меня $myHash, у инициатора $theirHash"
+    return
+  }
+  if ($arm.Once -and [int]$arm.Uses -ge 1) { Deny 'взведение одноразовое и уже использовано'; return }
+
+  # одноразовое взведение сжигаем ДО работы: обрыв связи не должен оставлять доступ живым
+  if ($arm.Once) { Remove-Item (Get-PeerFile 'armed.json') -Force -ErrorAction SilentlyContinue }
+
+  Write-PeerAudit "ACCEPT cmd=$cmd from=$from"
+  Write-Output 'RESULT=ok'
+  Write-Output "hash=$myHash"
+  Write-Output "host=$env:COMPUTERNAME"
+
+  switch ($cmd) {
+    'ping'   { Write-Output 'MSG=готов' }
+    'status' { Do-Status; Write-Output 'MSG=status выполнен' }
+    'detect' { Do-Detect; Write-Output 'MSG=detect выполнен' }
+    'mcjoin' { Do-McJoin; Write-Output 'MSG=mcjoin выполнен' }
+    'world'  {
+      $mode = if ($req['arg.mode']) { $req['arg.mode'] } else { 'list' }
+      if ($req['arg.world'])  { $script:World = $req['arg.world'] }
+      if ($req['arg.remote']) { $script:Remote = $req['arg.remote'] }
+      Do-World -Mode $mode
+      Write-Output "MSG=world $mode выполнен"
+    }
+    'sync'   {
+      $ld = $req['arg.local']; $rd = $req['arg.remote']
+      $mir = ($req['arg.mirror'] -eq '1')
+      if (-not $ld -or -not $rd) { Write-Output 'MSG=нужны arg.local и arg.remote' }
+      else {
+        Write-Host "Синхронизация: $ld <-> $rd"
+        $sres = Invoke-SyncPass -LocalDir $ld -RemoteDir $rd -Mirror:$mir
+        Write-Output "MSG=туда=$($sres.ToRemote) обратно=$($sres.ToLocal)"
+      }
+    }
+  }
+
+  Write-PeerAudit "DONE cmd=$cmd"
+  if ($RequestFile -and (Test-Path $RequestFile)) { Remove-Item $RequestFile -Force -ErrorAction SilentlyContinue }
 }
 
 # ================= ПРОСТОЕ МЕНЮ (для тех, кто не любит командную строку) =================
@@ -746,6 +1178,10 @@ function Do-Menu {
     Write-Host "   9  Minecraft: найти запущенную игру и LAN-порт (клиент-клиент)" -ForegroundColor Green
     Write-Host "  10  Minecraft: перенести/синхронизировать мир между машинами" -ForegroundColor Green
     Write-Host "  11  Двусторонняя общая папка (файлы туда-обратно, с автообновлением)" -ForegroundColor White
+    Write-Host "  12  ПАРТНЁР по SSH: ключ, залить скрипты, проверить связь" -ForegroundColor Magenta
+    Write-Host "  13  Разрешить приём с другой машины на N минут (взвести)" -ForegroundColor Magenta
+    Write-Host "  14  Синхронизация с партнёром по SSH (обе стороны сами)" -ForegroundColor Magenta
+    Write-Host "  15  Журнал удалённых действий" -ForegroundColor DarkGray
     Write-Host "   8  Убрать все настройки этой программы" -ForegroundColor DarkGray
     Write-Host "   0  Выход" -ForegroundColor DarkGray
     Write-Host ""
@@ -773,6 +1209,59 @@ function Do-Menu {
       }
       '8' { Start-Action 'remove' '' -AsAdmin }
       '9' { Start-Action 'detect' '' -AsAdmin }
+      '12' {
+        Write-Host "`n  Что делаем с партнёром?" -ForegroundColor Cyan
+        Write-Host "   1 — создать ключ тулкита (нужно один раз)"
+        Write-Host "   2 — добавить партнёра по IP"
+        Write-Host "   3 — залить скрипты на партнёра"
+        Write-Host "   4 — проверить связь"
+        Write-Host "   5 — показать список партнёров"
+        $s = Read-Host "  Цифра"
+        switch ($s) {
+          '1' { Do-PeerKeygen }
+          '2' {
+            $n = Read-Host "  Имя партнёра (латиницей, например pc2)"
+            $h = Read-Host "  IP партнёра"
+            $u = Read-Host "  Логин на партнёре (Enter = как тут: $env:USERNAME)"
+            $pl = Read-Host "  Система партнёра: [1] Windows [2] Linux [3] Android (Enter=2)"
+            $script:Peer = $n; $script:PeerHost = $h
+            if ($u) { $script:PeerUser = $u }
+            $script:PeerPlatform = switch ($pl) { '1' { 'win' } '3' { 'android' } default { 'linux' } }
+            Do-PeerAdd
+          }
+          '3' { $script:Peer = (Read-Host "  Имя партнёра"); Do-PeerBootstrap }
+          '4' { $script:Peer = (Read-Host "  Имя партнёра"); Do-PeerTest }
+          '5' { Do-PeerListCmd }
+        }
+      }
+      '13' {
+        Write-Host "`n  Придумай код (6+ символов) и скажи его тому, кто будет подключаться." -ForegroundColor Yellow
+        Write-Host "  Пока код действует, та машина сможет попросить эту синхронизироваться." -ForegroundColor Gray
+        $t = Read-Host "  Код (не показывается на экране — можно так и оставить пустым и отменить)"
+        if ($t) {
+          $m = Read-Host "  На сколько минут (Enter = 30, максимум 240)"
+          $script:Token = $t
+          if ($m) { $script:Minutes = [int]$m }
+          Do-PeerArm
+        }
+      }
+      '14' {
+        Do-PeerListCmd
+        $n = Read-Host "  Имя партнёра"
+        if ($n) {
+          $script:Peer = $n
+          $ld = Read-Host "  Моя папка (Enter = общая папка программы\обмен)"
+          $rd = Read-Host "  Папка на партнёре (Enter = то же имя у него)"
+          $sec = Read-Host "  Обновлять каждые N секунд? (Enter = один раз)"
+          if ($ld) { $script:Local = $ld }
+          if ($rd) { $script:RemoteDir = $rd }
+          if ($sec) { $script:Watch = [int]$sec }
+          $tk = Read-Host "  Код, который сказал человек на той машине (нужен, если там взведено)"
+          if ($tk) { $script:Token = $tk }
+          Do-PeerSync
+        }
+      }
+      '15' { Do-PeerLog }
       '10' {
         Write-Host "  Сначала посмотри список миров:"
         Start-Action 'world' '-WorldMode list' -AsAdmin
@@ -801,7 +1290,7 @@ function Do-Menu {
       '0' { return }
       default { Write-Host "  Не понял. Введи цифру из списка." -ForegroundColor Yellow; Start-Sleep 2 }
     }
-    if ($c -in '1','2','3','4','5','7','8','9','10','11') {
+    if ($c -in '1','2','3','4','5','7','8','9','10','11','12','13','14','15') {
       Write-Host ""
       Read-Host "  Готово. Нажми Enter, чтобы вернуться в меню"
     }
@@ -822,4 +1311,16 @@ switch ($Action) {
   'mount'   { Do-Mount }
   'unmount' { Do-Unmount }
   'remove'  { Do-Remove }
+  'peer-keygen'    { Do-PeerKeygen }
+  'peer-add'       { Do-PeerAdd }
+  'peer-list'      { Do-PeerListCmd }
+  'peer-forget'    { Do-PeerForget }
+  'peer-arm'       { Do-PeerArm }
+  'peer-disarm'    { Do-PeerDisarm }
+  'peer-test'      { Do-PeerTest }
+  'peer-bootstrap' { Do-PeerBootstrap }
+  'peer-run'       { Do-PeerRun }
+  'peer-sync'      { Do-PeerSync }
+  'peer-serve'     { Do-PeerServe -RequestFile $RequestFile }
+  'peer-log'       { Do-PeerLog }
 }

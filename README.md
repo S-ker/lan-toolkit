@@ -170,6 +170,77 @@ bash lan-android.sh sync ~/storage/shared/Download user@192.168.1.64:/home/user/
 `-Watch 30` = проход каждые 30 секунд (Ctrl+C — стоп), без числа — один проход.
 Логика без удалений; для полного зеркала добавь `-Mirror` (Windows) или `MIRROR=1`.
 
+## Режим «партнёр»: скрипт сам заходит на вторую машину
+
+Самый мощный и самый опасный режим: **скрипт подключается ко второй машине по SSH и
+просит её саму сделать свою половину синхронизации.** На обеих машинах должен лежать
+один и тот же тулкит (проверяется по хешу).
+
+Работает это так: инициатор по SSH запускает на второй машине `peer-serve`, передаёт
+запрос в stdin, а вторая сторона **сама решает, принимать ли** — и делает работу своими
+руками (свою шару, свой `robocopy`/`rsync`).
+
+### Настройка (4 шага)
+
+```powershell
+# 1) на ОБЕИХ машинах поставить тулкит, у себя создать ключ
+.\lan-win.ps1 peer-keygen
+
+# 2) сказать партнёру про себя и залить к нему скрипты
+.\lan-win.ps1 peer-add -Peer pc2 -PeerHost 192.168.1.50 -PeerUser kirit -PeerPlatform win
+.\lan-win.ps1 peer-bootstrap -Peer pc2
+
+# 3) добавить свой публичный ключ на вторую машину (см. вывод peer-keygen)
+#    Windows: C:\Users\<user>\.ssh\authorized_keys
+#    Linux/Android: ssh-copy-id -i ~/.lan-toolkit/keys/id_ed25519.pub user@IP
+
+# 4) НА ВТОРОЙ МАШИНЕ человек вручную взводит приём:
+#    bash lan-linux.sh peer-arm -t мойКод123 -m 30
+```
+Проверка: `.\lan-win.ps1 peer-test -Peer pc2`
+Синхронизация: `.\lan-win.ps1 peer-sync -Peer pc2 -Local "$env:USERPROFILE\Desktop\обмен" -RemoteDir /srv/lanshare/обмен -Watch 30`
+
+Без шага 4 (взведения) вторая машина **откажет** — это и есть главная защита.
+Взвести удалённо нельзя: команды `peer-arm`/`peer-disarm` не входят в белый список.
+
+### Что именно защищает
+
+| Защита | Как работает |
+|---|---|
+| SSH-доступ | Нужен уже разрешённый вход по ключу. Ключ тулкита добавляет человек на той машине. |
+| Взведение вручную | Пока на второй машине не выполнен `peer-arm`, любой запрос получает `denied`. |
+| Токен | Сравнивается SHA-256; в открытом виде нигде не хранится. Минимум 6 символов. |
+| Срок | Максимум 240 минут, потом приём автоматически закрывается. |
+| Одноразовость | `--once` — взведение сгорает после первого же запроса (гасится **до** работы, чтобы обрыв связи не оставлял доступ). |
+| Привязка к инициатору | `--fp "user@ПК"` — принимать только с одной конкретной машины. |
+| Белый список | Разрешены только `ping, hash, status, detect, world, sync`. Никакого произвольного кода. |
+| Сверка скриптов | Хеш тулкита должен совпадать на обеих машинах. Иначе отказ (обойти: `-AllowVersionDrift` / `ALLOW_DRIFT=1`). |
+| Журнал | `~/.lan-toolkit/audit.log` — и удачные запросы, и отказы с причиной. |
+| Отзыв | `peer-disarm` закрывает приём немедленно; `peer-forget` удаляет партнёра. |
+
+Состояние (ключи, список партнёров, взведение, журнал) лежит **вне** тулкита —
+в `~/.lan-toolkit`, поэтому не попадает ни в git, ни в копии папки обмена.
+
+### Что этот режим НЕ делает
+
+- Не взводит вторую машину сам и не просит пароль — только уже разрешённый SSH-доступ.
+- Не выполняет произвольные команды — только действия из белого списка.
+- Не прописывается в автозапуск и не держит постоянный канал: одно SSH-подключение на запрос.
+- Не хранит пароли: только SSH-ключ тулкита.
+
+### Варианты для остальных систем
+
+```bash
+sudo bash lan-linux.sh peer-keygen
+sudo bash lan-linux.sh peer-add pc2 192.168.1.50 kirit 22 win
+sudo bash lan-linux.sh peer-bootstrap pc2
+sudo bash lan-linux.sh peer-arm -t мойКод123 -m 30        # приём на этой машине
+sudo bash lan-linux.sh peer-test pc2
+sudo bash lan-linux.sh peer-sync pc2 /srv/lanshare/обмен /srv/lanshare/обмен 30
+bash lan-android.sh peer-arm -t мойКод123 -m 30           # телефон как цель
+bash lan-android.sh peer-sync pc  ~/storage/shared/lan  ~/lan
+```
+
 ## Порты
 
 | Порт | Протокол | Назначение |
@@ -180,6 +251,7 @@ bash lan-android.sh sync ~/storage/shared/Download user@192.168.1.64:/home/user/
 | 5353 | UDP | mDNS (`.local`, Linux/Android) |
 | 4445 | UDP | Мультикаст «Открыть для сети» (224.0.2.60) |
 | 22 / 8022 | TCP | SSH (Linux / Android-Termux) |
+| 22 | TCP | SSH-сервер на Windows (нужен для режима «партнёр») |
 | 8080 | TCP | HTTP-обмен файлами (меняется) |
 | 25565 | TCP+UDP | Minecraft Java |
 | 19132, 19133 | UDP | Minecraft Bedrock |
@@ -197,6 +269,11 @@ bash lan-android.sh sync ~/storage/shared/Download user@192.168.1.64:/home/user/
 .\lan-win.ps1 world -WorldMode list
 .\lan-win.ps1 world -WorldMode sync -World "выживание" -Remote \\192.168.1.50\LAN\mcworlds
 .\lan-win.ps1 sync -Remote \\192.168.1.50\LAN\обмен -Watch 30
+.\lan-win.ps1 peer-keygen
+.\lan-win.ps1 peer-add -Peer pc2 -PeerHost 192.168.1.50 -PeerPlatform win
+.\lan-win.ps1 peer-arm -Token мойКод123 -Minutes 30 -Once
+.\lan-win.ps1 peer-sync -Peer pc2 -Watch 30
+.\lan-win.ps1 peer-log
 .\lan-win.ps1 mount -Remote \\192.168.1.50\LAN -User lan -Drive Z
 .\lan-win.ps1 remove
 ```

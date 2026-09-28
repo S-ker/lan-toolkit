@@ -17,6 +17,8 @@ MC_DIR="${MC_DIR:-/srv/minecraft}"
 MC_PORT="${MC_PORT:-25565}"
 MC_MEM="${MC_MEM:-2G}"
 BEDROCK_PORT="${BEDROCK_PORT:-19132}"
+TOKEN="${TOKEN:-}"                  # токен для peer-синхронизации (взведение на той стороне)
+ALLOW_DRIFT="${ALLOW_DRIFT:-0}"     # 1 = не сверять хеш тулкита с инициатором
 
 C_G="\033[32m"; C_Y="\033[33m"; C_R="\033[31m"; C_C="\033[36m"; C_0="\033[0m"
 ok()   { echo -e "${C_G}[+]${C_0} $*"; }
@@ -377,6 +379,10 @@ do_world() {
   fi
 
   command -v rsync >/dev/null 2>&1 || pkg_install rsync
+  if ! command -v rsync >/dev/null 2>&1; then
+    err "rsync не установлен — поставь вручную (apt install rsync / pacman -S rsync / apk add rsync)"
+    return 1
+  fi
   local ROPTS=(-a --update --exclude=session.lock)
   if [ "$mode" = "push" ] || [ "$mode" = "sync" ]; then
     echo "  Отдаю мир в общую папку..."
@@ -396,6 +402,10 @@ do_sync() {
   local local_dir="${1:-$SHARE_DIR}" remote_dir="${2:-}" watch="${3:-0}"
   [ -n "$remote_dir" ] || { err "укажи: bash $0 sync <локальная папка> <папка-на-той-стороне> [секунды]"; return 1; }
   command -v rsync >/dev/null 2>&1 || pkg_install rsync
+  if ! command -v rsync >/dev/null 2>&1; then
+    err "rsync не установлен — поставь вручную (apt install rsync / pacman -S rsync / apk add rsync)"
+    return 1
+  fi
   mkdir -p "$local_dir"
   hdr "Двусторонний обмен"
   echo "  Локально : $local_dir"
@@ -444,6 +454,344 @@ do_remove() {
   ok "шара удалена, пользователь $SMB_USER убран"
 }
 
+# ============================================================
+#  PEER: удалённая синхронизация через SSH (см. README)
+#  На обеих машинах лежит один и тот же тулкит. Инициатор заходит по SSH
+#  и просит вторую сторону сделать её половину работы.
+#  Защиты: SSH-доступ, ручное ВЗВЕДЕНИЕ (peer-arm), токен, срок, белый список
+#  команд, сверка хеша тулкита, журнал. Взвести удалённо нельзя.
+# ============================================================
+PEER_HOME="${PEER_HOME:-$HOME/.lan-toolkit}"
+TOOLKIT_FILES=(lan-win.ps1 lan-linux.sh lan-android.sh mcping.py)
+
+peer_dir() { mkdir -p "$PEER_HOME/keys"; echo "$PEER_HOME"; }
+peer_key() { echo "$PEER_HOME/keys/id_ed25519"; }
+peer_kh()  { echo "$PEER_HOME/known_hosts_peers"; }
+peer_peers() { echo "$PEER_HOME/peers"; }
+
+sha_of_str() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
+toolkit_hash() {
+  local dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" body="" n fp h
+  for n in "${TOOLKIT_FILES[@]}"; do
+    fp="$dir/$n"
+    if [ -f "$fp" ]; then h=$(sha256sum -- "$fp" | cut -d' ' -f1); else h='-'; fi
+    body="${body}${n}:${h}\n"
+  done
+  printf '%b' "$body" | sha256sum | cut -d' ' -f1
+}
+
+peer_audit() { echo "$(date '+%Y-%m-%d %H:%M:%S')  $*" >> "$PEER_HOME/audit.log"; }
+
+peer_arm() {
+  local token="" minutes=30 once=0 allowfp=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --token|-t) token="${2:-}"; shift 2 ;;
+      --minutes|-m) minutes="${2:-30}"; shift 2 ;;
+      --once) once=1; shift ;;
+      --fp) allowfp="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  peer_dir >/dev/null
+  if [ -z "$token" ]; then err "нужен токен: peer-arm -t <код> [-m 30] [--once]"; return 1; fi
+  if [ "${#token}" -lt 6 ]; then err "токен короче 6 символов"; return 1; fi
+  [ "$minutes" -le 240 ] 2>/dev/null || { err "максимум 240 минут"; return 1; }
+  local exp=$(( $(date +%s) + minutes * 60 ))
+  {
+    echo "TokenHash=$(sha_of_str "$token")"
+    echo "Expires=$exp"
+    echo "Once=$once"
+    echo "AllowFp=$allowfp"
+    echo "ToolkitHash=$(toolkit_hash)"
+    echo "ArmedBy=$(whoami)@$(hostname)"
+  } > "$PEER_HOME/armed"
+  chmod 600 "$PEER_HOME/armed"
+  peer_audit "ARM на $minutes мин, once=$once"
+  ok "машина взведена на $minutes мин — принимаю удалённую синхронизацию"
+  echo "    отключить: bash $0 peer-disarm"
+}
+
+peer_disarm() {
+  peer_dir >/dev/null
+  rm -f "$PEER_HOME/armed"
+  peer_audit "DISARM"
+  ok "машина больше не принимает удалённые команды"
+}
+
+# --- принимающая сторона: читает запрос из stdin ---
+peer_serve() {
+  peer_dir >/dev/null
+  local raw cmd="" token="" from="" their_hash=""
+  raw="$(cat)"
+  local line key val
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    key="${line%%=*}"; val="${line#*=}"
+    case "$key" in
+      cmd) cmd="$val" ;;
+      token) token="$val" ;;
+      from) from="$val" ;;
+      hash) their_hash="$val" ;;
+      arg.local) ARG_LOCAL="$val" ;;
+      arg.remote) ARG_REMOTE="$val" ;;
+      arg.mode) ARG_MODE="$val" ;;
+      arg.world) ARG_WORLD="$val" ;;
+      arg.mirror) ARG_MIRROR="$val" ;;
+    esac
+  done <<< "$raw"
+
+  deny() { peer_audit "DENY cmd=$cmd from=$from: $1"; echo "RESULT=denied"; echo "MSG=$1"; }
+
+  [ -f "$PEER_HOME/armed" ] || { deny "машина не взведена: нужно выполнить peer-arm -t <код>"; return; }
+  # shellcheck disable=SC1090
+  local A_TOKENHASH A_EXPIRES A_ONCE A_ALLOWFP
+  A_TOKENHASH=$(grep '^TokenHash=' "$PEER_HOME/armed" | cut -d= -f2-)
+  A_EXPIRES=$(grep '^Expires=' "$PEER_HOME/armed" | cut -d= -f2-)
+  A_ONCE=$(grep '^Once=' "$PEER_HOME/armed" | cut -d= -f2-)
+  A_ALLOWFP=$(grep '^AllowFp=' "$PEER_HOME/armed" | cut -d= -f2-)
+  [ "$(date +%s)" -lt "$A_EXPIRES" ] || { deny "срок взведения истёк"; return; }
+  [ -n "$token" ] || { deny "не передан токен"; return; }
+  [ "$(sha_of_str "$token")" = "$A_TOKENHASH" ] || { deny "неверный токен"; return; }
+  if [ -n "$A_ALLOWFP" ] && [ "$A_ALLOWFP" != "$from" ]; then deny "инициатор $from не разрешён"; return; fi
+
+  local my_hash allowed=0
+  for c in ping hash status detect world sync; do
+    [ "$cmd" = "$c" ] && allowed=1
+  done
+  [ "$allowed" = "1" ] || { deny "команда '$cmd' не в белом списке"; return; }
+
+  my_hash=$(toolkit_hash)
+  if [ -n "$their_hash" ] && [ "$their_hash" != "$my_hash" ] && [ "${ALLOW_DRIFT:-0}" != "1" ]; then
+    peer_audit "DENY cmd=$cmd from=$from: hash mismatch"
+    echo "RESULT=denied"
+    echo "MSG=версии скриптов разные: у меня $my_hash, у инициатора $their_hash"
+    return
+  fi
+
+  # одноразовое взведение сжигаем ДО работы
+  [ "$A_ONCE" = "1" ] && rm -f "$PEER_HOME/armed"
+
+  peer_audit "ACCEPT cmd=$cmd from=$from"
+  echo "RESULT=ok"
+  echo "hash=$my_hash"
+  echo "host=$(hostname)"
+  case "$cmd" in
+    ping)   echo "MSG=готов" ;;
+    status) do_status; echo "MSG=status выполнен" ;;
+    detect) do_detect; echo "MSG=detect выполнен" ;;
+    world)  do_world "${ARG_MODE:-list}" "${ARG_WORLD:-}" "${ARG_REMOTE:-}"; echo "MSG=world выполнен" ;;
+    sync)
+      if [ -z "${ARG_LOCAL:-}" ] || [ -z "${ARG_REMOTE:-}" ]; then
+        echo "MSG=нужны arg.local и arg.remote"
+      else
+        if MIRROR="${ARG_MIRROR:-0}" do_sync "$ARG_LOCAL" "$ARG_REMOTE" 0; then
+          echo "MSG=sync выполнен"
+        else
+          echo "MSG=sync не удался (нет rsync или недоступна папка)"
+        fi
+      fi
+      ;;
+  esac
+  peer_audit "DONE cmd=$cmd"
+}
+
+# --- инициатор ---
+peer_keygen() {
+  peer_dir >/dev/null
+  local k; k="$(peer_key)"
+  if [ ! -f "$k" ]; then
+    ssh-keygen -t ed25519 -N '' -C "lan-toolkit@$(hostname)" -f "$k" >/dev/null
+    ok "создан ключ: $k"
+  else
+    ok "ключ уже есть: $k"
+  fi
+  echo
+  echo "Публичный ключ — добавить на ВТОРОЙ машине:"
+  cat "$k.pub"
+  echo
+  echo "  Linux/Android: ssh-copy-id -i $k.pub user@IP"
+  echo "  Windows      : строка в C:\\Users\\<user>\\.ssh\\authorized_keys"
+}
+
+peer_add() {
+  local name="${1:-}" host="${2:-}" user="${3:-$(whoami)}" port="${4:-22}" plat="${5:-linux}" tk="${6:-lan-toolkit}"
+  [ -n "$name" ] && [ -n "$host" ] || { err "укажи: peer-add <имя> <IP> [user] [порт] [win|linux|android]"; return 1; }
+  peer_dir >/dev/null
+  echo "Пинную host key..."
+  if ssh-keyscan -p "$port" "$host" > "$(peer_kh)" 2>/dev/null && [ -s "$(peer_kh)" ]; then
+    ok "host key сохранён"
+  else
+    warn "host key не прочитан — машина недоступна?"
+  fi
+  grep -v "^$name|" "$(peer_peers)" 2>/dev/null > "$(peer_peers).tmp" || true
+  mv "$(peer_peers).tmp" "$(peer_peers)" 2>/dev/null
+  echo "$name|$host|$user|$port|$plat|$tk" >> "$(peer_peers)"
+  ok "peer '$name' -> $user@$host:$port ($plat)"
+  echo
+  echo "Дальше:"
+  echo "  1) bash $0 peer-bootstrap $name     # залить тулкит на ту машину"
+  echo "  2) bash $0 peer-keygen              # и добавить ключ на ту машину"
+  echo "  3) НА ТОЙ МАШИНЕ человек: peer-arm -t <код>"
+  echo "  4) bash $0 peer-test $name"
+}
+
+peer_get() { grep "^$1|" "$(peer_peers)" 2>/dev/null | head -1; }
+
+peer_invoke() {
+  local name="$1" req="$2"
+  local rec; rec="$(peer_get "$name")"
+  [ -n "$rec" ] || { err "peer '$name' не найден (peer-list)"; return 1; }
+  local host user port plat tk
+  IFS='|' read -r _ host user port plat tk <<< "$rec"
+  [ -f "$(peer_key)" ] || { err "нет ключа — запусти: bash $0 peer-keygen"; return 1; }
+  local runner
+  if [ "$plat" = "win" ]; then
+    runner="powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\$(echo "$tk" | tr '/' '\\')\\lan-win.ps1\" -Action peer-serve"
+  elif [ "$plat" = "android" ]; then
+    runner="bash \"\$HOME/$tk/lan-android.sh\" peer-serve"
+  else
+    runner="bash \"\$HOME/$tk/lan-linux.sh\" peer-serve"
+  fi
+  printf '%s' "$req" | timeout 600 ssh -i "$(peer_key)" -p "$port" \
+    -o "UserKnownHostsFile=$(peer_kh)" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+    -o ConnectTimeout=8 "$user@$host" "$runner" 2>&1
+}
+
+peer_request() {
+  local cmd="$1" token="$2"; shift 2
+  local out="v=1
+cmd=$cmd
+token=$token
+from=$(whoami)@$(hostname)
+hash=$(toolkit_hash)"
+  while [ $# -gt 0 ]; do out="$out
+arg.${1}=${2}"; shift 2; done
+  printf '%s\n\n' "$out"
+}
+
+peer_result() { grep -m1 '^RESULT=' <<< "$1" | cut -d= -f2; }
+peer_msg()    { grep -m1 '^MSG=' <<< "$1" | cut -d= -f2-; }
+
+peer_list() {
+  peer_dir >/dev/null
+  if [ -s "$(peer_peers)" ]; then
+    echo -e "\nИзвестные партнёры:"
+    while IFS='|' read -r n h u p pl tk; do
+      printf '  %-10s %s@%s:%s  [%s]\n' "$n" "$u" "$h" "$p" "$pl"
+    done < "$(peer_peers)"
+  else
+    warn "партнёров нет — добавь: bash $0 peer-add <имя> <IP>"
+  fi
+  echo -e "\nСостояние ЭТОЙ машины (приём удалённых команд):"
+  if [ ! -f "$PEER_HOME/armed" ]; then
+    echo "  не взведена — удалённые команды отклоняются"
+  else
+    local exp left
+    exp=$(grep '^Expires=' "$PEER_HOME/armed" | cut -d= -f2-)
+    left=$(( (exp - $(date +%s)) / 60 ))
+    if [ "$left" -le 0 ]; then echo "  взведена, но срок истёк"; else echo "  ВЗВЕДЕНА ещё ~$left мин"; fi
+  fi
+}
+
+peer_forget() {
+  [ -n "${1:-}" ] || { err "укажи имя"; return 1; }
+  peer_dir >/dev/null
+  grep -v "^$1|" "$(peer_peers)" 2>/dev/null > "$(peer_peers).tmp" || true
+  mv "$(peer_peers).tmp" "$(peer_peers)" 2>/dev/null
+  peer_audit "peer-forget $1"
+  ok "партнёр '$1' удалён"
+}
+
+peer_bootstrap() {
+  local name="${1:-}"; [ -n "$name" ] || { err "укажи имя"; return 1; }
+  local rec; rec="$(peer_get "$name")"
+  [ -n "$rec" ] || { err "peer '$name' не найден"; return 1; }
+  local host user port plat tk
+  IFS='|' read -r _ host user port plat tk <<< "$rec"
+  local dir; dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  echo "Копирую тулкит на $user@$host ($plat)..."
+  # ssh использует -p, scp — -P: два разных набора опций
+  local SSHOPT=(-i "$(peer_key)" -p "$port" -o "UserKnownHostsFile=$(peer_kh)" -o StrictHostKeyChecking=yes -o BatchMode=yes)
+  local SCPOPT=(-i "$(peer_key)" -P "$port" -o "UserKnownHostsFile=$(peer_kh)" -o StrictHostKeyChecking=yes -o BatchMode=yes)
+  if [ "$plat" = "win" ]; then
+    ssh "${SSHOPT[@]}" "$user@$host" "mkdir \"$tk\" 2>nul & echo ok" >/dev/null 2>&1
+  else
+    ssh "${SSHOPT[@]}" "$user@$host" "mkdir -p \"\$HOME/$tk\"" >/dev/null 2>&1
+  fi
+  local okc=0 total=0 f
+  for f in "$dir"/*; do
+    case "$(basename "$f")" in .*|*.pyc) continue ;; esac
+    total=$((total+1))
+    if scp "${SCPOPT[@]}" "$f" "$user@$host:$tk/$(basename "$f")" >/dev/null 2>&1; then okc=$((okc+1)); fi
+  done
+  if [ "$plat" != "win" ]; then
+    ssh "${SSHOPT[@]}" "$user@$host" "chmod +x \"\$HOME/$tk\"/*.sh 2>/dev/null; echo ok" >/dev/null 2>&1
+  fi
+  ok "отправлено файлов: $okc из $total"
+  peer_audit "bootstrap $name ($okc файлов)"
+  echo "Теперь НА ТОЙ машине человек выполняет: peer-arm -t <код>"
+}
+
+peer_test() {
+  local name="${1:-}"; [ -n "$name" ] || { err "укажи имя"; return 1; }
+  local out; out="$(peer_invoke "$name" "$(peer_request ping '')")"
+  local res; res="$(peer_result "$out")"
+  echo
+  echo "Ответ второй стороны: RESULT=$res"
+  local m; m="$(peer_msg "$out")"
+  [ -n "$m" ] && echo "  MSG: $m"
+  case "$m" in
+    *"не взведена"*) echo "  -> на той машине: peer-arm -t <код>" ;;
+    *"токен"*)       echo "  -> токен не совпал" ;;
+    *"разные"*)      echo "  -> обнови тулкит на обеих машинах" ;;
+  esac
+  local rh; rh="$(grep -m1 '^hash=' <<< "$out" | cut -d= -f2)"
+  if [ -n "$rh" ]; then
+    if [ "$rh" = "$(toolkit_hash)" ]; then ok "скрипты совпадают"; else warn "версии скриптов разные"; fi
+  fi
+  peer_audit "test $name -> $res"
+}
+
+peer_sync() {
+  local name="${1:-}"; [ -n "$name" ] || { err "укажи имя"; return 1; }
+  local local_dir="${2:-}" remote_dir="${3:-}" sec="${4:-0}"
+  [ -n "$local_dir" ] || local_dir="$SHARE_DIR/обмен"
+  [ -n "$remote_dir" ] || remote_dir="$SHARE_DIR/обмен"
+  local rec; rec="$(peer_get "$name")"
+  [ -n "$rec" ] || { err "peer '$name' не найден"; return 1; }
+  local host user port plat tk
+  IFS='|' read -r _ host user port plat tk <<< "$rec"
+  hdr "Двусторонняя синхронизация с '$name'"
+  echo "  моя папка  : $local_dir"
+  echo "  у партнёра : $remote_dir"
+  mkdir -p "$local_dir"
+  # куда положить шара партнёра (SMB)
+  local peer_share="/mnt/peer-$name"
+  mkdir -p "$peer_share" 2>/dev/null
+  mountpoint -q "$peer_share" 2>/dev/null || \
+    mount -t cifs "//$host/$SHARE_NAME" "$peer_share" -o "username=$SMB_USER,password=${SMB_PASS},vers=3.0,uid=$(id -u),gid=$(id -g)" 2>/dev/null || \
+    warn "шара партнёра не смонтирована (моя половина может не пройти)"
+  local my_ip; my_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  while true; do
+    local out; out="$(peer_invoke "$name" "$(peer_request sync "$TOKEN" local "$remote_dir" remote "//$my_ip/$SHARE_NAME/$(basename "$local_dir")" mirror "${MIRROR:-0}")")"
+    local res; res="$(peer_result "$out")"
+    if [ "$res" = "ok" ]; then echo "  [$(date +%H:%M:%S)] вторая сторона: ок"; else echo "  [$(date +%H:%M:%S)] вторая сторона: $res — $(peer_msg "$out")"; fi
+    echo "  [$(date +%H:%M:%S)] моя сторона..."
+    rsync -a --update "$local_dir/" "$peer_share/$(basename "$local_dir")/" 2>/dev/null && echo "     туда ок"
+    rsync -a --update "$peer_share/$(basename "$local_dir")/" "$local_dir/" 2>/dev/null && echo "     обратно ок"
+    peer_audit "sync $name local=$local_dir remote=$remote_dir"
+    if [ "$sec" != "0" ] && [ "$sec" -gt 0 ] 2>/dev/null; then sleep "$sec"; else break; fi
+  done
+}
+
+peer_log() {
+  peer_dir >/dev/null
+  if [ -f "$PEER_HOME/audit.log" ]; then hdr "Журнал"; tail -40 "$PEER_HOME/audit.log"
+  else echo "журнал пуст"; fi
+}
+
 case "${1:-setup}" in
   setup)  do_setup "${@:2}" ;;
   share)  do_share "${@:2}" ;;
@@ -454,7 +802,18 @@ case "${1:-setup}" in
   detect|lan)   do_detect ;;
   world)        do_world "${@:2}" ;;
   sync)         do_sync "${@:2}" ;;
+  peer-serve)   peer_serve ;;
+  peer-keygen)  peer_keygen ;;
+  peer-add)     peer_add "${@:2}" ;;
+  peer-list)    peer_list ;;
+  peer-forget)  peer_forget "${@:2}" ;;
+  peer-arm)     peer_arm "${@:2}" ;;
+  peer-disarm)  peer_disarm ;;
+  peer-bootstrap) peer_bootstrap "${@:2}" ;;
+  peer-test)    peer_test "${@:2}" ;;
+  peer-sync)    peer_sync "${@:2}" ;;
+  peer-log)     peer_log ;;
   status) do_status ;;
   remove) do_remove "${@:2}" ;;
-  *) echo "usage: $0 {setup|share|http|mount|ssh|mc [java|bedrock|firewall|join]|detect|world [list|push|pull|sync|backup]|sync <local> <remote> [sec]|status|remove}"; exit 1 ;;
+  *) echo "usage: $0 {setup|share|http|mount|ssh|mc [java|bedrock|firewall|join]|detect|world [list|push|pull|sync|backup]|sync <local> <remote> [sec]|peer-<keygen|add|list|forget|arm|disarm|bootstrap|test|sync|log|serve>|status|remove}"; exit 1 ;;
 esac
