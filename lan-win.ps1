@@ -1185,14 +1185,11 @@ function Test-UpdateAllowed {
   return -not (Test-Path (Get-PeerFile 'noupdate'))
 }
 function Get-RemoteFileText([string]$path, [int]$TimeoutSec = 8) {
-  $url = "https://raw.githubusercontent.com/$UpdateRepo/$UpdateBranch/$path"
+  # ?nocache — иначе CDN GitHub отдаёт файл на коммит-другой старше
+  $url = "https://raw.githubusercontent.com/$UpdateRepo/$UpdateBranch/$path`?nocache=$([DateTime]::UtcNow.Ticks)"
   try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec $TimeoutSec
-    # Content в PS 5.1 может быть декодирован не как UTF-8 (ломает кириллические имена) —
-    # поэтому берём сырые байты и декодируем сами
-    try { $bytes = $r.RawContentStream.ToArray() } catch { $bytes = $null }
-    if ($bytes -and $bytes.Length -gt 0) { return [Text.Encoding]::UTF8.GetString($bytes) }
     return [string]$r.Content
   } catch { return $null }
 }
@@ -1269,18 +1266,22 @@ function Do-Update {
   Write-Host "  Проверяю содержимое..." -ForegroundColor Cyan
 
   # 2) сверяем sha256 каждого файла с MANIFEST.txt из репозитория
-  $manifest = Get-RemoteFileText 'MANIFEST.txt' 15
-  if (-not $manifest) {
-    Write-Host "  [!] Нет MANIFEST.txt — не могу проверить целостность, отменяю." -ForegroundColor Red
+  # берём MANIFEST.txt ИЗ САМОГО АРХИВА: читаем с диска как UTF-8 (сеть ненадёжно
+  # декодирует кириллические имена) и это гарантированно тот же коммит, что и файлы
+  $manPath = Join-Path $root.FullName 'MANIFEST.txt'
+  if (-not (Test-Path $manPath)) {
+    Write-Host "  [!] В архиве нет MANIFEST.txt — проверить целостность не могу, отменяю." -ForegroundColor Red
     Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
     return
   }
+  $manifest = [IO.File]::ReadAllText($manPath, [Text.Encoding]::UTF8)
   $bad = 0; $checked = 0
   foreach ($line in ($manifest -split "`r?`n")) {
     if ($line -notmatch '^([0-9a-fA-F]{64})\s+(.+)$') { continue }
     $sum = $Matches[1].ToLower(); $name = $Matches[2].Trim()
     $fp = Join-Path $root.FullName $name
-    if (-not (Test-Path $fp)) { Write-Host "    [!] нет файла $name" -ForegroundColor Red; $bad++; continue }
+    if (-not (Test-Path -LiteralPath $fp)) { Write-Host "    [!] нет файла $name" -ForegroundColor Red; $bad++; continue }
+    # LF-нормализация: архив отдаёт .ps1/.bat с CRLF, а суммы считаются без CR
     $got = Get-NormalizedHash $fp
     if ($got -ne $sum) { Write-Host "    [!] не сходится сумма: $name" -ForegroundColor Red; $bad++; continue }
     $checked++

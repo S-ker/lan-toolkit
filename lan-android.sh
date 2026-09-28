@@ -588,7 +588,7 @@ http_get() {
 }
 
 local_version() { [ -f "$LOCAL_DIR/VERSION" ] && tr -d ' \t\r\n' < "$LOCAL_DIR/VERSION" || echo "0.0.0"; }
-remote_version() { http_get "$RAW_BASE/VERSION" 2>/dev/null | tr -d ' \t\r\n'; }
+remote_version() { http_get "$RAW_BASE/VERSION?nocache=$(date +%s)" 2>/dev/null | tr -d ' \t\r\n'; }
 
 ver_newer() {
   [ "$1" = "$2" ] && return 1
@@ -632,11 +632,20 @@ do_update() {
   local root; root="$(find "$tmp" -maxdepth 1 -type d ! -path "$tmp" | head -1)"
   [ -n "$root" ] || { err "пустой архив"; rm -rf "$tmp"; return 1; }
   echo "  Проверяю содержимое..."
-  http_get "$RAW_BASE/MANIFEST.txt" "$root/MANIFEST.txt" || { err "нет MANIFEST.txt — отменяю"; rm -rf "$tmp"; return 1; }
-  if ! (cd "$root" && sha256sum -c MANIFEST.txt --quiet >/dev/null 2>&1); then
-    err "суммы не сошлись — ничего не меняю"; rm -rf "$tmp"; return 1
+  [ -f "$root/MANIFEST.txt" ] || { err "в архиве нет MANIFEST.txt — отменяю"; rm -rf "$tmp"; return 1; }
+  local bad=0 checked=0 sum name fp got
+  while read -r sum name; do
+    [ -n "${name:-}" ] || continue
+    fp="$root/$name"
+    if [ ! -f "$fp" ]; then err "нет файла $name"; bad=$((bad+1)); continue; fi
+    got="$(norm_hash "$fp")"
+    if [ "$got" != "$sum" ]; then err "не сходится сумма: $name"; bad=$((bad+1)); continue; fi
+    checked=$((checked+1))
+  done < "$root/MANIFEST.txt"
+  if [ "$bad" -gt 0 ] || [ "$checked" -eq 0 ]; then
+    err "проверка не прошла ($bad ошибок) — ничего не меняю"; rm -rf "$tmp"; return 1
   fi
-  ok "суммы сошлись"
+  ok "суммы сошлись: $checked файлов"
   local f
   for f in lan-android.sh lan-linux.sh start-linux.sh; do
     [ -f "$root/$f" ] && { bash -n "$root/$f" || { err "новый $f с ошибкой синтаксиса — отменяю"; rm -rf "$tmp"; return 1; }; }

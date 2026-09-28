@@ -817,7 +817,7 @@ http_get() { # $1 = url, $2 = выходной файл (пусто = в stdout)
 }
 
 local_version() { [ -f "$LOCAL_DIR/VERSION" ] && tr -d ' \t\r\n' < "$LOCAL_DIR/VERSION" || echo "0.0.0"; }
-remote_version() { http_get "$RAW_BASE/VERSION" 2>/dev/null | tr -d ' \t\r\n'; }
+remote_version() { http_get "$RAW_BASE/VERSION?nocache=$(date +%s)" 2>/dev/null | tr -d ' \t\r\n'; }
 
 ver_newer() { # $1 новее $2 ?
   [ "$1" = "$2" ] && return 1
@@ -867,15 +867,23 @@ do_update() {
   [ -n "$root" ] || { err "пустой архив"; rm -rf "$tmp"; return 1; }
 
   echo "  Проверяю содержимое..."
-  if ! http_get "$RAW_BASE/MANIFEST.txt" "$root/MANIFEST.txt"; then
-    err "нет MANIFEST.txt — проверить целостность не могу, отменяю"; rm -rf "$tmp"; return 1
-  fi
-  if ! (cd "$root" && sha256sum -c MANIFEST.txt --quiet >/dev/null 2>&1); then
-    err "суммы не сошлись — ничего не меняю"
-    (cd "$root" && sha256sum -c MANIFEST.txt 2>&1 | grep -v ': OK$' | head -5)
+  # MANIFEST берём из самого архива (тот же коммит) и сверяем с LF-нормализацией:
+  # архив GitHub отдаёт .ps1/.bat с CRLF, а суммы считаются без CR
+  [ -f "$root/MANIFEST.txt" ] || { err "в архиве нет MANIFEST.txt — отменяю"; rm -rf "$tmp"; return 1; }
+  local bad=0 checked=0 sum name fp got
+  while read -r sum name; do
+    [ -n "${name:-}" ] || continue
+    fp="$root/$name"
+    if [ ! -f "$fp" ]; then err "нет файла $name"; bad=$((bad+1)); continue; fi
+    got="$(norm_hash "$fp")"
+    if [ "$got" != "$sum" ]; then err "не сходится сумма: $name"; bad=$((bad+1)); continue; fi
+    checked=$((checked+1))
+  done < "$root/MANIFEST.txt"
+  if [ "$bad" -gt 0 ] || [ "$checked" -eq 0 ]; then
+    err "проверка не прошла ($bad ошибок) — ничего не меняю"
     rm -rf "$tmp"; return 1
   fi
-  ok "суммы сошлись"
+  ok "суммы сошлись: $checked файлов"
 
   local f
   for f in lan-linux.sh lan-android.sh start-linux.sh; do
