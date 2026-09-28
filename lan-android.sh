@@ -664,7 +664,7 @@ do_update() {
   echo "  Бэкап: $bk"
   local n=0
   while IFS= read -r f; do
-    case "$(basename "$f")" in .git*) continue ;; esac
+    [ -n "$f" ] || continue
     cp -f "$f" "$LOCAL_DIR/$(basename "$f")" && n=$((n+1))
   done < <(find "$root" -maxdepth 1 -type f)
   chmod +x "$LOCAL_DIR"/*.sh 2>/dev/null
