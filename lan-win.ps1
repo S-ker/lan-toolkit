@@ -1294,12 +1294,23 @@ function Do-Update {
       return
     }
   }
-  $bash = Get-Command bash -EA SilentlyContinue
-  if ($bash) {
+  # В PATH у Windows первым обычно C:\Windows\system32\bash.exe — заглушка WSL, она падает
+  # с ошибкой. Поэтому ищем Git Bash; если его нет — проверку .sh пропускаем, чтобы не
+  # объявить рабочий файл сломанным.
+  $bashExe = $null
+  foreach ($c in @("$env:ProgramFiles\Git\bin\bash.exe", "${env:ProgramFiles(x86)}\Git\bin\bash.exe",
+                   "$env:LOCALAPPDATA\Programs\Git\bin\bash.exe")) {
+    if ($c -and (Test-Path $c)) { $bashExe = $c; break }
+  }
+  if ($bashExe) {
+    & $bashExe -c 'exit 0' 2>$null
+    if ($LASTEXITCODE -ne 0) { $bashExe = $null }
+  }
+  if ($bashExe) {
     foreach ($sh in @('lan-linux.sh','lan-android.sh','start-linux.sh')) {
       $item = ($queue | Where-Object { $_.Name -eq $sh } | Select-Object -First 1)
       if ($item) {
-        & $bash.Source -n $item.Temp 2>$null
+        & $bashExe -n $item.Temp 2>$null
         if ($LASTEXITCODE -ne 0) {
           Write-Host "  [!] Новый $sh с ошибкой синтаксиса — отменяю." -ForegroundColor Red
           Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
@@ -1307,6 +1318,8 @@ function Do-Update {
         }
       }
     }
+  } else {
+    Write-Host "  (bash не найден — синтаксис .sh пропускаю)" -ForegroundColor DarkGray
   }
 
   # 3) бэкап текущих файлов, затем замена
