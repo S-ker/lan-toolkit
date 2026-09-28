@@ -346,12 +346,13 @@ peer_key() { echo "$PEER_HOME/keys/id_ed25519"; }
 peer_kh()  { echo "$PEER_HOME/known_hosts_peers"; }
 peer_peers() { echo "$PEER_HOME/peers"; }
 sha_of_str() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+norm_hash() { tr -d '\r' < "$1" | sha256sum | cut -d' ' -f1; }
 
 toolkit_hash() {
   local dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" body="" n fp h
   for n in "${TOOLKIT_FILES[@]}"; do
     fp="$dir/$n"
-    if [ -f "$fp" ]; then h=$(sha256sum -- "$fp" | cut -d' ' -f1); else h='-'; fi
+    if [ -f "$fp" ]; then h=$(norm_hash "$fp"); else h='-'; fi
     body="${body}${n}:${h}\n"
   done
   printf '%b' "$body" | sha256sum | cut -d' ' -f1

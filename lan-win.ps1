@@ -785,15 +785,30 @@ function Get-StrHash([string]$s) {
   $sha = [Security.Cryptography.SHA256]::Create()
   return (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s)) | ForEach-Object { $_.ToString('x2') }) -join '')
 }
+function Get-NormalizedHash([string]$path) {
+  # sha256 содержимого с переводами строк, приведёнными к LF.
+  # Так Windows (CRLF в рабочей копии) и Linux (LF) дают одинаковый хеш,
+  # и он же совпадает с содержимым архива GitHub (там всегда LF).
+  $bytes = [IO.File]::ReadAllBytes($path)
+  $ms = New-Object IO.MemoryStream
+  for ($i = 0; $i -lt $bytes.Length; $i++) {
+    if ($bytes[$i] -eq 13 -and ($i + 1) -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
+    $ms.WriteByte($bytes[$i])
+  }
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $h = (($sha.ComputeHash($ms.ToArray()) | ForEach-Object { $_.ToString('x2') }) -join '')
+  $ms.Dispose()
+  return $h
+}
 function Get-ToolkitHash {
   # Фиксированный список файлов — так хеш совпадает и в PowerShell, и в bash.
   # Отсутствующий файл считается пустым ('-'), поэтому Linux без lan-win.ps1
-  # даст тот же хеш, что и Windows.
+  # даст тот же хеш, что и Windows. Переводы строк не влияют (LF-нормализация).
   $names = @('lan-win.ps1','lan-linux.sh','lan-android.sh','mcping.py')
   $sb = New-Object Text.StringBuilder
   foreach ($n in $names) {
     $fp = Join-Path $PSScriptRoot $n
-    $h = if (Test-Path $fp) { (Get-FileHash -Algorithm SHA256 -Path $fp).Hash.ToLower() } else { '-' }
+    $h = if (Test-Path $fp) { (Get-NormalizedHash $fp) } else { '-' }
     [void]$sb.Append($n).Append(':').Append($h).Append("`n")
   }
   return (Get-StrHash $sb.ToString())
@@ -1174,7 +1189,11 @@ function Get-RemoteFileText([string]$path, [int]$TimeoutSec = 8) {
   try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec $TimeoutSec
-    return $r.Content
+    # Content в PS 5.1 может быть декодирован не как UTF-8 (ломает кириллические имена) —
+    # поэтому берём сырые байты и декодируем сами
+    try { $bytes = $r.RawContentStream.ToArray() } catch { $bytes = $null }
+    if ($bytes -and $bytes.Length -gt 0) { return [Text.Encoding]::UTF8.GetString($bytes) }
+    return [string]$r.Content
   } catch { return $null }
 }
 function Get-RemoteVersion([int]$TimeoutSec = 8) {
@@ -1262,7 +1281,7 @@ function Do-Update {
     $sum = $Matches[1].ToLower(); $name = $Matches[2].Trim()
     $fp = Join-Path $root.FullName $name
     if (-not (Test-Path $fp)) { Write-Host "    [!] нет файла $name" -ForegroundColor Red; $bad++; continue }
-    $got = (Get-FileHash -Algorithm SHA256 -Path $fp).Hash.ToLower()
+    $got = Get-NormalizedHash $fp
     if ($got -ne $sum) { Write-Host "    [!] не сходится сумма: $name" -ForegroundColor Red; $bad++; continue }
     $checked++
   }
@@ -1330,7 +1349,7 @@ function New-Manifest {
   foreach ($n in $names) {
     $fp = Join-Path $PSScriptRoot $n
     if (Test-Path $fp) {
-      $lines.Add(((Get-FileHash -Algorithm SHA256 -Path $fp).Hash.ToLower() + '  ' + $n))
+      $lines.Add(((Get-NormalizedHash $fp) + '  ' + $n))
     }
   }
   $out = Join-Path $PSScriptRoot 'MANIFEST.txt'

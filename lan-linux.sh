@@ -470,12 +470,15 @@ peer_kh()  { echo "$PEER_HOME/known_hosts_peers"; }
 peer_peers() { echo "$PEER_HOME/peers"; }
 
 sha_of_str() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+# хеш содержимого с LF-переводами строк: одинаково на Windows и Linux,
+# и совпадает с тем, что лежит в архиве GitHub
+norm_hash() { tr -d '\r' < "$1" | sha256sum | cut -d' ' -f1; }
 
 toolkit_hash() {
   local dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}" body="" n fp h
   for n in "${TOOLKIT_FILES[@]}"; do
     fp="$dir/$n"
-    if [ -f "$fp" ]; then h=$(sha256sum -- "$fp" | cut -d' ' -f1); else h='-'; fi
+    if [ -f "$fp" ]; then h=$(norm_hash "$fp"); else h='-'; fi
     body="${body}${n}:${h}\n"
   done
   printf '%b' "$body" | sha256sum | cut -d' ' -f1
@@ -924,7 +927,7 @@ make_manifest() {
   : > "$LOCAL_DIR/MANIFEST.txt"
   for n in "${names[@]}"; do
     [ -f "$LOCAL_DIR/$n" ] || continue
-    printf '%s  %s\n' "$(sha256sum -- "$LOCAL_DIR/$n" | cut -d' ' -f1)" "$n" >> "$LOCAL_DIR/MANIFEST.txt"
+    printf '%s  %s\n' "$(norm_hash "$LOCAL_DIR/$n")" "$n" >> "$LOCAL_DIR/MANIFEST.txt"
   done
   ok "MANIFEST.txt обновлён"
 }
