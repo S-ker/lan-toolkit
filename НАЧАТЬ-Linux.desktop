@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Локальная сеть + Minecraft
+Comment=Общая папка, SSH и Minecraft-сервер в один клик
+Terminal=true
+Icon=network-workgroup
+Exec=sh -c 'cd "$(dirname "$1")"; bash start-linux.sh' sh %k
+Categories=Network;Utility;

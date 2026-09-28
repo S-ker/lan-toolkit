@@ -1,0 +1,11 @@
+# Все текстовые файлы — нормализуем
+* text=auto
+
+# Shell-скрипты ОБЯЗАНЫ быть LF, иначе Linux/Android падает на \r
+*.sh      text eol=lf
+*.desktop text eol=lf
+
+# Windows-файлы
+*.bat     text eol=crlf
+*.ps1     text eol=crlf
+*.md      text eol=lf
