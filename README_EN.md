@@ -11,6 +11,30 @@ network visibility, SSH, file exchange via a browser, a mobile hotspot and a Min
 
 ---
 
+## What's new in version 1.6
+
+- **Nested menu.** The main items (network, address, sharing, connecting to a foreign folder,
+  hotspot) are on top; Minecraft, files/worlds, SSH partner, update and service are in separate
+  sections. All actions run **in the same window** without extra windows and without a repeated
+  "Press Enter" after each action.
+- **Windows no longer close too quickly.** Information (IP, status) stays on screen until you
+  press Enter; on the command line this is the `-Pause` flag.
+- **SSH partner is configured automatically.** "SSH partner → 1" creates the key, installs it on
+  the second machine (asks for the password once), uploads the scripts, arms reception and checks
+  the link. Previously this was done manually.
+- **World transfer with automatic selection.** "Minecraft → Transfer world" shows found worlds,
+  offers to pick the world and where to send/take it (own folder or `\\IP\LAN`).
+- **Network is saved and restored.** `setup` makes a snapshot of the network configuration
+  (profiles, services, shares), and `remove` restores it.
+- **Minecraft server downloads itself.** If `server.jar` is missing, the menu offers to download
+  Vanilla / Paper / Fabric (you can set `-ServerType`).
+- **Automatic logging.** All actions are written to `~/.lan-toolkit/lan.log`; the log is in the
+  "Service" section.
+- **Works as a DSH plugin.** In `dsh-plugin/` there is a ready Host plugin with `lan_toolkit_*`
+  tools and the `lan-toolkit` agent skill.
+
+---
+
 ## Quick start
 
 ### Windows
@@ -18,7 +42,7 @@ network visibility, SSH, file exchange via a browser, a mobile hotspot and a Min
 1. Launch `НАЧАТЬ-Windows.bat` (or `START-Windows.bat`) by double-clicking.
 2. Confirm the User Account Control prompt ("Allow this app to make changes") — "Yes".
 3. In the menu that opens, select item **`1`** and press Enter: the network is prepared.
-   Items 4 and 5 in the same menu are responsible for Minecraft.
+   Minecraft is section **`6`** (server, friend address, world transfer).
 
 ### Linux
 
@@ -65,8 +89,8 @@ If double-clicking does not work: open the directory in a terminal and run `bash
 ## Update
 
 The current version is shown in the menu header. If a newer one is published in the repository,
-the menu displays `>>> ДОСТУПНО ОБНОВЛЕНИЕ <<<`, and the update is started by item **16** (Windows),
-**17** (Linux) or **14** (Android). From the command line:
+the menu displays `>>> ДОСТУПНО ОБНОВЛЕНИЕ <<<`, and the update is started by section **9 → 1**
+(Windows), **17** (Linux) or **14** (Android). From the command line:
 
 ```powershell
 .\lan-win.ps1 update-check     # check only
@@ -131,7 +155,7 @@ participants connect by the host's IP. Limitation: the host must remain in the g
 
 | Side | Action |
 |---|---|
-| Windows | menu → item **4** (asks for the amount of memory in GB). The file `server.jar` is placed in `%PUBLIC%\LANShare\minecraft` |
+| Windows | menu → **6** → **1** (asks for the amount of memory in GB; if `server.jar` is missing, offers to download Vanilla/Paper/Fabric). The file `server.jar` is placed in `%PUBLIC%\LANShare\minecraft` |
 | Linux | menu → item **4** (Java/Paper, downloaded automatically) or **5** (Bedrock server) |
 | Android | menu → item **6** (server on the phone, for 1–2 people; `termux-wake-lock` beforehand) |
 
@@ -387,7 +411,7 @@ python3 mcping.py bedrock 192.168.1.20        # Bedrock-сервер (UDP 19132)
 ## Diagnostics
 
 1. **No ping** → different subnets (`ipconfig` / `ip a`). If the Wi-Fi is a guest network, the devices
-   are isolated: enable the hotspot (Windows menu, item 6) and connect the others to it.
+   are isolated: enable the hotspot (Windows menu, item **5**) and connect the others to it.
 2. **Ping works, the share is not visible** → firewall: item 1 of the Windows menu opens the required rules.
 3. **A password is requested** → a real Windows account is needed (an empty password over the network
    is forbidden by policy).
@@ -400,5 +424,5 @@ python3 mcping.py bedrock 192.168.1.20        # Bedrock-сервер (UDP 19132)
 ## Security
 
 - The share is available to the entire local network; it is not recommended to use it on public Wi-Fi.
-- `remove` (item 8/9 in the menu) rolls back the changes made.
+- `remove` (section **S** → **1** in the menu) rolls back the changes made.
 - The SMB password on Linux is generated randomly and displayed once — save it.

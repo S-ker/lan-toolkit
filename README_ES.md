@@ -11,6 +11,30 @@ punto de acceso móvil y servidor de Minecraft (Java y Bedrock).
 
 ---
 
+## Novedades en la versión 1.6
+
+- **Menú anidado.** Los elementos principales (red, dirección, compartir, conectar a una carpeta
+  ajena, punto de acceso) están arriba; Minecraft, archivos/mundos, el socio por SSH, la actualización
+  y el servicio están en secciones aparte. Todas las acciones se ejecutan **en la misma ventana** — sin
+  ventanas extra y sin un nuevo «Pulsa Enter» tras cada acción.
+- **Las ventanas ya no se cierran demasiado rápido.** La información (IP, estado) permanece en pantalla
+  hasta que pulses Enter; en la línea de comandos es la opción `-Pause`.
+- **El socio SSH se configura automáticamente.** «Socio SSH → 1» crea la clave, la instala en el
+  segundo equipo (pide la contraseña una vez), sube los scripts, activa la recepción y comprueba el
+  enlace. Antes se hacía manualmente.
+- **Transferencia de mundos con selección automática.** «Minecraft → Transferir mundo» muestra los
+  mundos encontrados y ofrece elegir el mundo y a dónde enviarlo/recogerlo (carpeta propia o `\\IP\LAN`).
+- **La red se guarda y se restaura.** `setup` hace una instantánea de la configuración de red (perfiles,
+  servicios, recursos compartidos) y `remove` la restaura.
+- **El servidor de Minecraft se descarga solo.** Si falta `server.jar`, el menú ofrece descargar
+  Vanilla / Paper / Fabric (se puede indicar con `-ServerType`).
+- **Registro automático.** Todas las acciones se escriben en `~/.lan-toolkit/lan.log`; el registro está
+  en la sección «Servicio».
+- **Funciona como plugin de DSH.** En `dsh-plugin/` hay un plugin Host listo con herramientas
+  `lan_toolkit_*` y la habilidad de agente `lan-toolkit`.
+
+---
+
 ## Inicio rápido
 
 ### Windows
@@ -18,7 +42,7 @@ punto de acceso móvil y servidor de Minecraft (Java y Bedrock).
 1. Inicie `НАЧАТЬ-Windows.bat` (o `START-Windows.bat`) con doble clic.
 2. Confirme la solicitud de control de cuentas de usuario («Permitir que esta aplicación haga cambios») — «Sí».
 3. En el menú que se abre, seleccione la opción **`1`** y pulse Enter: la red queda preparada.
-   Las opciones 4 y 5 del mismo menú corresponden a Minecraft.
+   Minecraft es la sección **`6`** (servidor, dirección para amigos, transferencia de mundos).
 
 ### Linux
 
@@ -65,8 +89,8 @@ Si el doble clic no funciona: abra el directorio en la terminal y ejecute `bash 
 ## Actualización
 
 La versión actual se muestra en el encabezado del menú. Si en el repositorio se ha publicado una más
-reciente, el menú muestra `>>> ДОСТУПНО ОБНОВЛЕНИЕ <<<`, y la actualización se inicia con la opción
-**16** (Windows), **17** (Linux) o **14** (Android). Desde la línea de comandos:
+reciente, el menú muestra `>>> ДОСТУПНО ОБНОВЛЕНИЕ <<<`, y la actualización se inicia con la sección
+**9 → 1** (Windows), **17** (Linux) o **14** (Android). Desde la línea de comandos:
 
 ```powershell
 .\lan-win.ps1 update-check     # solo comprobar
@@ -132,7 +156,7 @@ participantes se conectan por la IP del anfitrión. Limitación: el anfitrión d
 
 | Lado | Acción |
 |---|---|
-| Windows | menú → opción **4** (solicita la cantidad de memoria en GB). El archivo `server.jar` se coloca en `%PUBLIC%\LANShare\minecraft` |
+| Windows | menú → **6** → **1** (solicita la cantidad de memoria en GB; si falta `server.jar`, ofrece descargar Vanilla/Paper/Fabric). El archivo `server.jar` se coloca en `%PUBLIC%\LANShare\minecraft` |
 | Linux | menú → opción **4** (Java/Paper, se descarga automáticamente) u **5** (servidor Bedrock) |
 | Android | menú → opción **6** (servidor en el teléfono, para 1–2 personas; antes `termux-wake-lock`) |
 
@@ -391,7 +415,7 @@ python3 mcping.py bedrock 192.168.1.20        # servidor Bedrock (UDP 19132)
 ## Diagnóstico
 
 1. **No hay ping** → subredes distintas (`ipconfig` / `ip a`). Si el Wi-Fi es de invitados, los dispositivos
-   están aislados: active el punto de acceso (menú de Windows, opción 6) y conecte los demás a él.
+   están aislados: active el punto de acceso (menú de Windows, opción **5**) y conecte los demás a él.
 2. **Hay ping, pero no se ve el recurso compartido** → cortafuegos: la opción 1 del menú de Windows abre las reglas necesarias.
 3. **Se solicita contraseña** → se necesita una cuenta real de Windows (la política prohíbe una contraseña
    vacía en la red).
@@ -404,5 +428,5 @@ python3 mcping.py bedrock 192.168.1.20        # servidor Bedrock (UDP 19132)
 ## Seguridad
 
 - El recurso compartido es accesible a toda la red local; no se recomienda usarlo en Wi-Fi públicas.
-- `remove` (opción 8/9 del menú) revierte los cambios realizados.
+- `remove` (sección **S** → **1** del menú) revierte los cambios realizados.
 - La contraseña SMB en Linux se genera aleatoriamente y se muestra una sola vez — guárdela.

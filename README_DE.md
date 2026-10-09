@@ -11,6 +11,30 @@ mobiler Hotspot und Minecraft-Server (Java und Bedrock).
 
 ---
 
+## Neues in Version 1.6
+
+- **Verschachteltes Menü.** Die Hauptpunkte (Netzwerk, Adresse, Freigabe, Verbinden mit einem fremden
+  Ordner, Hotspot) stehen oben; Minecraft, Dateien/Welten, SSH-Partner, Aktualisierung und Dienst
+  befinden sich in eigenen Abschnitten. Alle Aktionen laufen **im selben Fenster** — ohne zusätzliche
+  Fenster und ohne erneutes „Eingabetaste drücken" nach jeder Aktion.
+- **Fenster schließen sich nicht mehr zu schnell.** Informationen (IP, Status) bleiben bis zum
+  Drücken der Eingabetaste sichtbar; in der Kommandozeile ist das der Schalter `-Pause`.
+- **SSH-Partner wird automatisch eingerichtet.** „SSH-Partner → 1" erstellt den Schlüssel, installiert
+  ihn auf dem zweiten Gerät (fragt einmal nach dem Passwort), lädt die Skripte hoch, aktiviert den
+  Empfang und prüft die Verbindung. Früher geschah das manuell.
+- **Welten-Transfer mit automatischer Auswahl.** „Minecraft → Welt übertragen" zeigt gefundene Welten
+  und bietet an, die Welt sowie das Ziel (eigener Ordner oder `\\IP\LAN`) zu wählen.
+- **Netzwerk wird gesichert und wiederhergestellt.** `setup` erstellt einen Snapshot der
+  Netzwerkkonfiguration (Profile, Dienste, Freigaben), `remove` stellt sie wieder her.
+- **Minecraft-Server lädt sich selbst.** Fehlt `server.jar`, bietet das Menü an, Vanilla / Paper /
+  Fabric herunterzuladen (einstellbar über `-ServerType`).
+- **Automatische Protokollierung.** Alle Aktionen werden in `~/.lan-toolkit/lan.log` geschrieben;
+  das Protokoll liegt im Abschnitt „Dienst".
+- **Funktioniert als DSH-Plugin.** In `dsh-plugin/` gibt es ein fertiges Host-Plugin mit
+  `lan_toolkit_*`-Werkzeugen und dem `lan-toolkit`-Agenten-Skill.
+
+---
+
 ## Schnellstart
 
 ### Windows
@@ -18,7 +42,7 @@ mobiler Hotspot und Minecraft-Server (Java und Bedrock).
 1. Starten Sie `НАЧАТЬ-Windows.bat` (oder `START-Windows.bat`) per Doppelklick.
 2. Bestätigen Sie die Abfrage der Benutzerkontensteuerung („Dieser App erlauben, Änderungen vorzunehmen") mit „Ja".
 3. Wählen Sie im geöffneten Menü den Punkt **`1`** und drücken Sie die Eingabetaste: das Netzwerk ist vorbereitet.
-   Die Punkte 4 und 5 im selben Menü betreffen Minecraft.
+   Minecraft ist der Abschnitt **`6`** (Server, Freundesadresse, Welten-Transfer).
 
 ### Linux
 
@@ -66,7 +90,7 @@ Falls der Doppelklick nicht funktioniert: Öffnen Sie das Verzeichnis im Termina
 
 Die aktuelle Version wird in der Kopfzeile des Menüs angezeigt. Ist im Repository eine neuere
 Version veröffentlicht, gibt das Menü `>>> ДОСТУПНО ОБНОВЛЕНИЕ <<<` aus; die Aktualisierung wird
-über Punkt **16** (Windows), **17** (Linux) oder **14** (Android) gestartet. Über die Kommandozeile:
+über Abschnitt **9 → 1** (Windows), **17** (Linux) oder **14** (Android) gestartet. Über die Kommandozeile:
 
 ```powershell
 .\lan-win.ps1 update-check     # nur prüfen
@@ -135,7 +159,7 @@ Teilnehmer verbinden sich über die IP des Hosts. Einschränkung: Der Host muss 
 
 | Seite | Aktion |
 |---|---|
-| Windows | Menü → Punkt **4** (fragt den Arbeitsspeicher in GB ab). Die Datei `server.jar` wird in `%PUBLIC%\LANShare\minecraft` gelegt |
+| Windows | Menü → **6** → **1** (fragt den Arbeitsspeicher in GB ab; fehlt `server.jar`, wird der Download von Vanilla/Paper/Fabric angeboten). Die Datei `server.jar` wird in `%PUBLIC%\LANShare\minecraft` gelegt |
 | Linux | Menü → Punkt **4** (Java/Paper, wird automatisch geladen) oder **5** (Bedrock-Server) |
 | Android | Menü → Punkt **6** (Server auf dem Telefon, für 1–2 Personen; vorher `termux-wake-lock`) |
 
@@ -395,7 +419,7 @@ python3 mcping.py bedrock 192.168.1.20        # Bedrock-Server (UDP 19132)
 ## Fehlerdiagnose
 
 1. **Kein Ping** → unterschiedliche Subnetze (`ipconfig` / `ip a`). Ist das Wi-Fi ein Gastnetz, sind
-   die Geräte isoliert: Hotspot einschalten (Windows-Menü, Punkt 6) und die übrigen Geräte damit
+   die Geräte isoliert: Hotspot einschalten (Windows-Menü, Punkt **5**) und die übrigen Geräte damit
    verbinden.
 2. **Ping vorhanden, Freigabe nicht sichtbar** → Firewall: Punkt 1 des Windows-Menüs öffnet die
    nötigen Regeln.
@@ -411,5 +435,5 @@ python3 mcping.py bedrock 192.168.1.20        # Bedrock-Server (UDP 19132)
 
 - Die Freigabe ist für das gesamte lokale Netzwerk zugänglich; von der Nutzung in öffentlichen
   Wi-Fi-Netzen wird abgeraten.
-- `remove` (Punkt 8/9 im Menü) macht die vorgenommenen Änderungen rückgängig.
+- `remove` (Abschnitt **S** → **1** im Menü) macht die vorgenommenen Änderungen rückgängig.
 - Das SMB-Kennwort unter Linux wird zufällig erzeugt und einmal ausgegeben — bewahren Sie es auf.
