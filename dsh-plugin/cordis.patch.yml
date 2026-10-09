@@ -1,0 +1,4 @@
+- insert:
+    - id: lan-toolkit
+      name: '@local/lan-toolkit'
+      config: {}

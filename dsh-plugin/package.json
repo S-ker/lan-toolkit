@@ -1,0 +1,25 @@
+{
+  "name": "@local/lan-toolkit",
+  "version": "1.6.0",
+  "private": true,
+  "type": "module",
+  "description": "LAN Toolkit: network sharing, Minecraft server/world, SSH peers — agent tools.",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "bin/*.ps1",
+    "bin/*.sh",
+    "locale/*.json",
+    "skills/**"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
